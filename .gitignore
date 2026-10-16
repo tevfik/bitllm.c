@@ -1,0 +1,13 @@
+build*/
+bin/
+lib/
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+.DS_Store
+*.eifm
+*.bin
+*.gguf
+tests/data/*.gguf
