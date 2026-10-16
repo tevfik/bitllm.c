@@ -76,8 +76,11 @@ if(BITLLM_ENABLE_VULKAN AND Vulkan_FOUND)
     target_link_libraries(bitllm_static PRIVATE ${Vulkan_LIBRARIES})
 endif()
 
-# Backward compatibility alias
+# Backward compatibility alias & symlinks
 add_library(eif_runtime_static ALIAS bitllm_static)
+add_custom_command(TARGET bitllm_static POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E create_symlink $<TARGET_FILE_NAME:bitllm_static> ${CMAKE_BINARY_DIR}/libeif_runtime.a
+)
 
 # 2. Shared Library (libbitllm.so / .dll)
 add_library(bitllm_shared SHARED ${BITLLM_SOURCES})
@@ -93,8 +96,11 @@ if(BITLLM_ENABLE_VULKAN AND Vulkan_FOUND)
     target_link_libraries(bitllm_shared PRIVATE ${Vulkan_LIBRARIES})
 endif()
 
-# Backward compatibility alias
+# Backward compatibility alias & symlinks
 add_library(eif_runtime_shared ALIAS bitllm_shared)
+add_custom_command(TARGET bitllm_shared POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E create_symlink $<TARGET_FILE_NAME:bitllm_shared> ${CMAKE_BINARY_DIR}/libeif_runtime.so
+)
 
 # 3. CLI Runner Executable (bitllm-run & eif-run alias)
 add_executable(bitllm-run cli/main.c)
