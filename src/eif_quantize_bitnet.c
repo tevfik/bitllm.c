@@ -1070,12 +1070,11 @@ static inline int32_t dotprod_i8_avx2(const int8_t *input, const uint8_t *row_w,
         __m128i in_lo_8 = _mm_loadu_si128((const __m128i *)&input[col]);
         __m256i in16 = _mm256_cvtepi8_epi16(in_lo_8);
 
-        int8_t w_buf[16];
-        memcpy(w_buf + 0,  s_byte_weights_i8[row_w[byte_idx + 0]], 4);
-        memcpy(w_buf + 4,  s_byte_weights_i8[row_w[byte_idx + 1]], 4);
-        memcpy(w_buf + 8,  s_byte_weights_i8[row_w[byte_idx + 2]], 4);
-        memcpy(w_buf + 12, s_byte_weights_i8[row_w[byte_idx + 3]], 4);
-        __m128i w_lo_8 = _mm_loadu_si128((const __m128i *)w_buf);
+        uint32_t w0 = *(const uint32_t *)s_byte_weights_i8[row_w[byte_idx + 0]];
+        uint32_t w1 = *(const uint32_t *)s_byte_weights_i8[row_w[byte_idx + 1]];
+        uint32_t w2 = *(const uint32_t *)s_byte_weights_i8[row_w[byte_idx + 2]];
+        uint32_t w3 = *(const uint32_t *)s_byte_weights_i8[row_w[byte_idx + 3]];
+        __m128i w_lo_8 = _mm_setr_epi32((int)w0, (int)w1, (int)w2, (int)w3);
         __m256i w16 = _mm256_cvtepi8_epi16(w_lo_8);
 
         __m256i prod32 = _mm256_madd_epi16(in16, w16);
@@ -1224,6 +1223,136 @@ void eif_matmul_bitnet_act_quant_f32(const uint8_t *weights,
     }
 }
 
+#if defined(EIF_HAS_AVX2)
+__attribute__((target("avx2,fma")))
+static void matmul_bitnet_block_f32_avx2(const uint8_t *weights,
+                                         const float *block_scales,
+                                         int block_size,
+                                         const float *input,
+                                         const float *bias,
+                                         float *output,
+                                         int rows,
+                                         int cols)
+{
+    ensure_byte_weights();
+    if (block_size <= 0) block_size = 64;
+    const int num_blocks_per_row = (cols + block_size - 1) / block_size;
+    const int row_bytes = (cols + 3) / 4;
+
+    #pragma omp parallel for schedule(static) if((int64_t)rows * cols >= 16384)
+    for (int row = 0; row < rows; row++) {
+        const uint8_t *row_w = weights + (row * row_bytes);
+        const float *scales_row = block_scales ? (block_scales + row * num_blocks_per_row) : NULL;
+        float total_sum = 0.0f;
+
+        for (int b = 0; b < num_blocks_per_row; b++) {
+            int start_col = b * block_size;
+            int end_col = start_col + block_size;
+            if (end_col > cols) end_col = cols;
+
+            float block_sum = 0.0f;
+            int col = start_col;
+            int byte_idx = start_col / 4;
+
+            if ((start_col % 4) == 0) {
+                __m256 acc256 = _mm256_setzero_ps();
+                for (; col <= end_col - 8; col += 8, byte_idx += 2) {
+                    uint8_t b0 = row_w[byte_idx];
+                    uint8_t b1 = row_w[byte_idx + 1];
+                    __m128 w_low = _mm_loadu_ps(s_byte_weights[b0]);
+                    __m128 w_high = _mm_loadu_ps(s_byte_weights[b1]);
+                    __m256 w8 = _mm256_set_m128(w_high, w_low);
+                    __m256 in8 = _mm256_loadu_ps(&input[col]);
+                    acc256 = _mm256_fmadd_ps(in8, w8, acc256);
+                }
+                float hsum;
+                AVX2_HSUM(acc256, hsum);
+                block_sum += hsum;
+
+                for (; col <= end_col - 4; col += 4, byte_idx++) {
+                    const float *w4 = s_byte_weights[row_w[byte_idx]];
+                    block_sum += input[col]     * w4[0]
+                               + input[col + 1] * w4[1]
+                               + input[col + 2] * w4[2]
+                               + input[col + 3] * w4[3];
+                }
+            }
+
+            for (; col < end_col; col++) {
+                int b_idx = col / 4;
+                int pos = col % 4;
+                uint8_t code = (uint8_t)((row_w[b_idx] >> (pos * 2)) & 0x03u);
+                if (code == 1u) block_sum += input[col];
+                else if (code == 2u) block_sum -= input[col];
+            }
+
+            float b_scale = scales_row ? scales_row[b] : 1.0f;
+            total_sum += block_sum * b_scale;
+        }
+
+        output[row] = total_sum + (bias ? bias[row] : 0.0f);
+    }
+}
+#endif
+
+#if defined(EIF_HAS_NEON)
+static void matmul_bitnet_block_f32_neon(const uint8_t *weights,
+                                         const float *block_scales,
+                                         int block_size,
+                                         const float *input,
+                                         const float *bias,
+                                         float *output,
+                                         int rows,
+                                         int cols)
+{
+    ensure_byte_weights();
+    if (block_size <= 0) block_size = 64;
+    const int num_blocks_per_row = (cols + block_size - 1) / block_size;
+    const int row_bytes = (cols + 3) / 4;
+
+    #pragma omp parallel for schedule(static) if((int64_t)rows * cols >= 16384)
+    for (int row = 0; row < rows; row++) {
+        const uint8_t *row_w = weights + (row * row_bytes);
+        const float *scales_row = block_scales ? (block_scales + row * num_blocks_per_row) : NULL;
+        float total_sum = 0.0f;
+
+        for (int b = 0; b < num_blocks_per_row; b++) {
+            int start_col = b * block_size;
+            int end_col = start_col + block_size;
+            if (end_col > cols) end_col = cols;
+
+            float block_sum = 0.0f;
+            int col = start_col;
+            int byte_idx = start_col / 4;
+
+            if ((start_col % 4) == 0) {
+                float32x4_t acc = vdupq_n_f32(0.0f);
+                for (; col <= end_col - 4; col += 4, byte_idx++) {
+                    float32x4_t w4 = vld1q_f32(s_byte_weights[row_w[byte_idx]]);
+                    float32x4_t in4 = vld1q_f32(&input[col]);
+                    acc = vmlaq_f32(acc, in4, w4);
+                }
+                block_sum += vgetq_lane_f32(acc, 0) + vgetq_lane_f32(acc, 1) +
+                             vgetq_lane_f32(acc, 2) + vgetq_lane_f32(acc, 3);
+            }
+
+            for (; col < end_col; col++) {
+                int b_idx = col / 4;
+                int pos = col % 4;
+                uint8_t code = (uint8_t)((row_w[b_idx] >> (pos * 2)) & 0x03u);
+                if (code == 1u) block_sum += input[col];
+                else if (code == 2u) block_sum -= input[col];
+            }
+
+            float b_scale = scales_row ? scales_row[b] : 1.0f;
+            total_sum += block_sum * b_scale;
+        }
+
+        output[row] = total_sum + (bias ? bias[row] : 0.0f);
+    }
+}
+#endif
+
 void eif_matmul_bitnet_block_f32(const uint8_t *weights,
                                  const float *block_scales,
                                  int block_size,
@@ -1233,6 +1362,16 @@ void eif_matmul_bitnet_block_f32(const uint8_t *weights,
                                  int rows,
                                  int cols)
 {
+#if defined(EIF_HAS_AVX2)
+    if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
+        matmul_bitnet_block_f32_avx2(weights, block_scales, block_size, input, bias, output, rows, cols);
+        return;
+    }
+#elif defined(EIF_HAS_NEON)
+    matmul_bitnet_block_f32_neon(weights, block_scales, block_size, input, bias, output, rows, cols);
+    return;
+#endif
+
     ensure_byte_weights();
     if (block_size <= 0) block_size = 64;
     const int num_blocks_per_row = (cols + block_size - 1) / block_size;
@@ -1401,9 +1540,123 @@ int eif_bitnet_group_size(int n, int max_group)
     return 0;
 }
 
+#if defined(EIF_HAS_AVX2)
+__attribute__((target("avx2,fma")))
+static void hadamard_rotate_f32_avx2(float *x, const float *signs, int n, int block)
+{
+    if (signs) {
+        int i = 0;
+        for (; i <= n - 8; i += 8) {
+            __m256 vx = _mm256_loadu_ps(x + i);
+            __m256 vs = _mm256_loadu_ps(signs + i);
+            _mm256_storeu_ps(x + i, _mm256_mul_ps(vx, vs));
+        }
+        for (; i < n; i++) x[i] *= signs[i];
+    }
+    const float norm = 1.0f / sqrtf((float)block);
+    const __m256 vnorm = _mm256_set1_ps(norm);
+
+    for (int base = 0; base < n; base += block) {
+        float *v = x + base;
+        for (int h = 1; h < block; h *= 2) {
+            for (int i = 0; i < block; i += 2 * h) {
+                if (h >= 8) {
+                    int j = i;
+                    for (; j <= i + h - 8; j += 8) {
+                        __m256 va = _mm256_loadu_ps(v + j);
+                        __m256 vb = _mm256_loadu_ps(v + j + h);
+                        _mm256_storeu_ps(v + j, _mm256_add_ps(va, vb));
+                        _mm256_storeu_ps(v + j + h, _mm256_sub_ps(va, vb));
+                    }
+                    for (; j < i + h; j++) {
+                        float a = v[j], b = v[j + h];
+                        v[j] = a + b;
+                        v[j + h] = a - b;
+                    }
+                } else {
+                    for (int j = i; j < i + h; j++) {
+                        float a = v[j], b = v[j + h];
+                        v[j] = a + b;
+                        v[j + h] = a - b;
+                    }
+                }
+            }
+        }
+        int i = 0;
+        for (; i <= block - 8; i += 8) {
+            __m256 vv = _mm256_loadu_ps(v + i);
+            _mm256_storeu_ps(v + i, _mm256_mul_ps(vv, vnorm));
+        }
+        for (; i < block; i++) v[i] *= norm;
+    }
+}
+#endif
+
+#if defined(EIF_HAS_NEON)
+static void hadamard_rotate_f32_neon(float *x, const float *signs, int n, int block)
+{
+    if (signs) {
+        int i = 0;
+        for (; i <= n - 4; i += 4) {
+            float32x4_t vx = vld1q_f32(x + i);
+            float32x4_t vs = vld1q_f32(signs + i);
+            vst1q_f32(x + i, vmulq_f32(vx, vs));
+        }
+        for (; i < n; i++) x[i] *= signs[i];
+    }
+    const float norm = 1.0f / sqrtf((float)block);
+    const float32x4_t vnorm = vdupq_n_f32(norm);
+
+    for (int base = 0; base < n; base += block) {
+        float *v = x + base;
+        for (int h = 1; h < block; h *= 2) {
+            for (int i = 0; i < block; i += 2 * h) {
+                if (h >= 4) {
+                    int j = i;
+                    for (; j <= i + h - 4; j += 4) {
+                        float32x4_t va = vld1q_f32(v + j);
+                        float32x4_t vb = vld1q_f32(v + j + h);
+                        vst1q_f32(v + j, vaddq_f32(va, vb));
+                        vst1q_f32(v + j + h, vsubq_f32(va, vb));
+                    }
+                    for (; j < i + h; j++) {
+                        float a = v[j], b = v[j + h];
+                        v[j] = a + b;
+                        v[j + h] = a - b;
+                    }
+                } else {
+                    for (int j = i; j < i + h; j++) {
+                        float a = v[j], b = v[j + h];
+                        v[j] = a + b;
+                        v[j + h] = a - b;
+                    }
+                }
+            }
+        }
+        int i = 0;
+        for (; i <= block - 4; i += 4) {
+            float32x4_t vv = vld1q_f32(v + i);
+            vst1q_f32(v + i, vmulq_f32(vv, vnorm));
+        }
+        for (; i < block; i++) v[i] *= norm;
+    }
+}
+#endif
+
 void eif_hadamard_rotate_f32(float *x, const float *signs, int n, int block)
 {
     if (!x || block <= 0 || n % block != 0) return;
+
+#if defined(EIF_HAS_AVX2)
+    if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
+        hadamard_rotate_f32_avx2(x, signs, n, block);
+        return;
+    }
+#elif defined(EIF_HAS_NEON)
+    hadamard_rotate_f32_neon(x, signs, n, block);
+    return;
+#endif
+
     if (signs) {
         for (int i = 0; i < n; i++) x[i] *= signs[i];
     }
