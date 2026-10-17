@@ -76,6 +76,14 @@ cmake --build build -j$(nproc)
   --prompt "Extract the total amount from this invoice."
 ```
 
+**Granite-Docling (document OCR / tables):** the ready-made ternary model is published at
+[`tevfikk/granite-docling-258M-bitnet`](https://huggingface.co/tevfikk/granite-docling-258M-bitnet)
+(`granite_docling_bitnet_dense.eifm` + `tokenizer.bin`). Its vision tower is stored as **INT8 per-row weights**
+(`SVLM` config, SigLIP header `qtype = 1`); INT4 per group, optionally with a Walsh-Hadamard rotation, is supported too
+(`qtype = 2`, see `include/eif_siglip.h`). Each ViT matrix is dequantised into a scratch buffer right before its GEMM.
+Runtimes older than this support reading the model silently produce no output ("Generated Tokens: -3").
+This project was previously published as `eif-runtime`.
+
 ---
 
 ## 🧩 Embedding into Gleann / C Applications

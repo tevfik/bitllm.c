@@ -41,10 +41,28 @@ typedef struct {
     int32_t  num_patches;     /* 1024 */
     int32_t  conn_in_dim;     /* 12288 (16 * 768) */
     int32_t  conn_out_dim;    /* 576 (Language model dimension) */
-    int32_t  qtype;           /* 0 = FP32 */
+    int32_t  qtype;           /* ViT linear weights: EIF_SIGLIP_Q_* */
     uint32_t total_payload;   /* Total bytes of vision weights */
-    uint32_t reserved[2];
+    uint32_t reserved[2];     /* [0] INT4 group size (0 = per row), [1] 1 = Hadamard-rotated weights */
 } eif_siglip_header_t;
+
+/* Storage of the 72 ViT projection matrices (q, k, v, out, fc1, fc2 of each layer); everything else stays FP32.
+ * Quantised matrices are dequantised into a scratch buffer right before each GEMM, so the FP32 SIMD / Vulkan GEMMs
+ * are reused unchanged and RAM holds only the compressed weights. Layout of one quantised [N, K] matrix:
+ *   INT8: int8 codes [N*K], then FP32 scales [N] (symmetric, absmax / 127 per row)
+ *   INT4: packed codes [N*K/2] (two's-complement nibbles, low nibble = even column), then FP32 scales
+ *         [N * K/G] (absmax / 7 per group of G input weights; G = reserved[0], 0 means one group per row)
+ * With reserved[1] = 1 the stored matrix is W' = W·D·H (blockwise Walsh-Hadamard, eif_hadamard_block_size(K));
+ * the sign vectors D for K = 768 and K = 3072 follow the header (FP32 +-1) and the loader un-rotates on dequant.
+ * Matches sdk/eif_tools/quantize/vit_weight_quant.py. */
+#define EIF_SIGLIP_Q_FP32 0
+#define EIF_SIGLIP_Q_INT8 1
+#define EIF_SIGLIP_Q_INT4 2
+
+typedef struct {
+    const uint8_t *codes;     /* NULL for FP32 matrices */
+    const float *scales;
+} eif_siglip_qmat_t;
 
 typedef struct {
     /* LayerNorm 1 */
@@ -67,6 +85,8 @@ typedef struct {
     const float *fc1_b;       /* [3072] */
     const float *fc2_w;       /* [768, 3072] */
     const float *fc2_b;       /* [768] */
+    /* Quantised storage (header.qtype != FP32): q, k, v, out, fc1, fc2 */
+    eif_siglip_qmat_t qm[6];
 } eif_siglip_layer_t;
 
 typedef struct {
@@ -86,6 +106,10 @@ typedef struct {
 
     /* Connector */
     const float *conn_w;      /* [576, 12288] */
+
+    /* Hadamard signs (header.reserved[1] = 1) */
+    const float *had_signs_768;
+    const float *had_signs_3072;
 
     bool is_initialized;
     uint8_t *allocated_weights; /* Non-NULL if loaded from file and owns memory */
@@ -112,6 +136,16 @@ int eif_siglip_init_from_buffer(eif_siglip_t *model, const void *buffer, size_t 
  * @return 0 on success, negative error code on failure.
  */
 int eif_siglip_load_from_file(eif_siglip_t *model, const char *filepath, size_t offset, size_t size);
+
+/** @brief sizeof(eif_siglip_t), for language bindings that allocate the struct. */
+size_t eif_siglip_struct_size(void);
+
+/**
+ * @brief Dequantise one ViT projection (layer l, matrix m: 0 q, 1 k, 2 v, 3 out, 4 fc1, 5 fc2) into FP32 [N, K].
+ *        For FP32 models this copies the stored weight. Exposed for verification.
+ * @return 0 on success, negative on bad arguments.
+ */
+int eif_siglip_dequant_weight(const eif_siglip_t *model, int l, int m, float *out);
 
 /**
  * @brief Free any dynamically allocated weights in SigLIP model.

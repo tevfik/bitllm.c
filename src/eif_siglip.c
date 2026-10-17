@@ -4,6 +4,7 @@
  */
 
 #include "eif_siglip.h"
+#include "eif_quantize_bitnet.h"
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 
@@ -11,6 +12,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #define SIGLIP_PATCH_SIZE   16
 #define SIGLIP_IMG_SIZE     512
@@ -23,6 +27,33 @@
 #define SIGLIP_CONN_IN      12288
 #define SIGLIP_CONN_OUT     576
 #define SIGLIP_NUM_TOKENS   64
+
+/* Bytes of one stored ViT projection [N, K] for the header's qtype (codes + scales). */
+static size_t siglip_mat_bytes(const eif_siglip_header_t *h, int N, int K)
+{
+    if (h->qtype == EIF_SIGLIP_Q_INT8) return (size_t)N * K + (size_t)N * sizeof(float);
+    if (h->qtype == EIF_SIGLIP_Q_INT4) {
+        int g = h->reserved[0] > 0 ? (int)h->reserved[0] : K;
+        return (size_t)N * K / 2 + (size_t)N * (K / g) * sizeof(float);
+    }
+    return (size_t)N * K * sizeof(float);
+}
+
+/* Point *w (FP32) or *qm (quantised) at the matrix stored at ptr; returns the pointer past it. */
+static const uint8_t *siglip_take_mat(const eif_siglip_header_t *h, const uint8_t *ptr, int N, int K,
+                                      const float **w, eif_siglip_qmat_t *qm)
+{
+    if (h->qtype == EIF_SIGLIP_Q_FP32) {
+        *w = (const float *)ptr;
+        qm->codes = NULL;
+        qm->scales = NULL;
+    } else {
+        *w = NULL;
+        qm->codes = ptr;
+        qm->scales = (const float *)(ptr + (h->qtype == EIF_SIGLIP_Q_INT8 ? (size_t)N * K : (size_t)N * K / 2));
+    }
+    return ptr + siglip_mat_bytes(h, N, K);
+}
 
 int eif_siglip_init_from_buffer(eif_siglip_t *model, const void *buffer, size_t buffer_size)
 {
@@ -42,8 +73,23 @@ int eif_siglip_init_from_buffer(eif_siglip_t *model, const void *buffer, size_t 
     }
 
     model->header = *hdr;
+    if (hdr->qtype != EIF_SIGLIP_Q_FP32 && hdr->qtype != EIF_SIGLIP_Q_INT8 && hdr->qtype != EIF_SIGLIP_Q_INT4) {
+        fprintf(stderr, "[EIF SigLIP Error] Unsupported vision qtype %d\n", hdr->qtype);
+        return -5;
+    }
+    if (hdr->qtype == EIF_SIGLIP_Q_INT4 && hdr->reserved[0] > 0 &&
+        (SIGLIP_HIDDEN_SIZE % hdr->reserved[0] != 0 || SIGLIP_INTERM_SIZE % hdr->reserved[0] != 0)) {
+        fprintf(stderr, "[EIF SigLIP Error] INT4 group %u does not divide 768 and 3072\n", hdr->reserved[0]);
+        return -5;
+    }
 
     const uint8_t *ptr = (const uint8_t *)buffer + sizeof(eif_siglip_header_t);
+    if (hdr->reserved[1]) {
+        model->had_signs_768 = (const float *)ptr;
+        ptr += SIGLIP_HIDDEN_SIZE * sizeof(float);
+        model->had_signs_3072 = (const float *)ptr;
+        ptr += SIGLIP_INTERM_SIZE * sizeof(float);
+    }
 
     /* 1. Embeddings */
     model->pe_w = (const float *)ptr;
@@ -62,25 +108,25 @@ int eif_siglip_init_from_buffer(eif_siglip_t *model, const void *buffer, size_t 
         layer->ln1_w = (const float *)ptr; ptr += SIGLIP_HIDDEN_SIZE * sizeof(float);
         layer->ln1_b = (const float *)ptr; ptr += SIGLIP_HIDDEN_SIZE * sizeof(float);
 
-        layer->q_w = (const float *)ptr; ptr += (size_t)SIGLIP_HIDDEN_SIZE * SIGLIP_HIDDEN_SIZE * sizeof(float);
+        ptr = siglip_take_mat(hdr, ptr, SIGLIP_HIDDEN_SIZE, SIGLIP_HIDDEN_SIZE, &layer->q_w, &layer->qm[0]);
         layer->q_b = (const float *)ptr; ptr += SIGLIP_HIDDEN_SIZE * sizeof(float);
 
-        layer->k_w = (const float *)ptr; ptr += (size_t)SIGLIP_HIDDEN_SIZE * SIGLIP_HIDDEN_SIZE * sizeof(float);
+        ptr = siglip_take_mat(hdr, ptr, SIGLIP_HIDDEN_SIZE, SIGLIP_HIDDEN_SIZE, &layer->k_w, &layer->qm[1]);
         layer->k_b = (const float *)ptr; ptr += SIGLIP_HIDDEN_SIZE * sizeof(float);
 
-        layer->v_w = (const float *)ptr; ptr += (size_t)SIGLIP_HIDDEN_SIZE * SIGLIP_HIDDEN_SIZE * sizeof(float);
+        ptr = siglip_take_mat(hdr, ptr, SIGLIP_HIDDEN_SIZE, SIGLIP_HIDDEN_SIZE, &layer->v_w, &layer->qm[2]);
         layer->v_b = (const float *)ptr; ptr += SIGLIP_HIDDEN_SIZE * sizeof(float);
 
-        layer->out_w = (const float *)ptr; ptr += (size_t)SIGLIP_HIDDEN_SIZE * SIGLIP_HIDDEN_SIZE * sizeof(float);
+        ptr = siglip_take_mat(hdr, ptr, SIGLIP_HIDDEN_SIZE, SIGLIP_HIDDEN_SIZE, &layer->out_w, &layer->qm[3]);
         layer->out_b = (const float *)ptr; ptr += SIGLIP_HIDDEN_SIZE * sizeof(float);
 
         layer->ln2_w = (const float *)ptr; ptr += SIGLIP_HIDDEN_SIZE * sizeof(float);
         layer->ln2_b = (const float *)ptr; ptr += SIGLIP_HIDDEN_SIZE * sizeof(float);
 
-        layer->fc1_w = (const float *)ptr; ptr += (size_t)SIGLIP_INTERM_SIZE * SIGLIP_HIDDEN_SIZE * sizeof(float);
+        ptr = siglip_take_mat(hdr, ptr, SIGLIP_INTERM_SIZE, SIGLIP_HIDDEN_SIZE, &layer->fc1_w, &layer->qm[4]);
         layer->fc1_b = (const float *)ptr; ptr += SIGLIP_INTERM_SIZE * sizeof(float);
 
-        layer->fc2_w = (const float *)ptr; ptr += (size_t)SIGLIP_HIDDEN_SIZE * SIGLIP_INTERM_SIZE * sizeof(float);
+        ptr = siglip_take_mat(hdr, ptr, SIGLIP_HIDDEN_SIZE, SIGLIP_INTERM_SIZE, &layer->fc2_w, &layer->qm[5]);
         layer->fc2_b = (const float *)ptr; ptr += SIGLIP_HIDDEN_SIZE * sizeof(float);
     }
 
@@ -154,6 +200,62 @@ void eif_siglip_free(eif_siglip_t *model)
         model->allocated_weights = NULL;
     }
     model->is_initialized = false;
+}
+
+size_t eif_siglip_struct_size(void) { return sizeof(eif_siglip_t); }
+
+int eif_siglip_dequant_weight(const eif_siglip_t *model, int l, int m, float *out)
+{
+    if (!model || !model->is_initialized || !out || l < 0 || l >= SIGLIP_NUM_LAYERS || m < 0 || m > 5) return -1;
+    const eif_siglip_layer_t *L = &model->layers[l];
+    const float *fp[6] = {L->q_w, L->k_w, L->v_w, L->out_w, L->fc1_w, L->fc2_w};
+    const int N = (m == 4) ? SIGLIP_INTERM_SIZE : SIGLIP_HIDDEN_SIZE;
+    const int K = (m == 5) ? SIGLIP_INTERM_SIZE : SIGLIP_HIDDEN_SIZE;
+    const eif_siglip_header_t *h = &model->header;
+    if (h->qtype == EIF_SIGLIP_Q_FP32) {
+        memcpy(out, fp[m], (size_t)N * K * sizeof(float));
+        return 0;
+    }
+    const eif_siglip_qmat_t *q = &L->qm[m];
+    const int g = (h->qtype == EIF_SIGLIP_Q_INT4 && h->reserved[0] > 0) ? (int)h->reserved[0] : K;
+    const int ng = K / g;
+    const float *signs = (K == SIGLIP_HIDDEN_SIZE) ? model->had_signs_768 : model->had_signs_3072;
+    const int block = eif_hadamard_block_size(K);
+    #pragma omp parallel for schedule(static) if(!omp_in_parallel())
+    for (int r = 0; r < N; r++) {
+        float *row = out + (size_t)r * K;
+        if (h->qtype == EIF_SIGLIP_Q_INT8) {
+            const int8_t *c = (const int8_t *)q->codes + (size_t)r * K;
+            const float s = q->scales[r];
+            for (int i = 0; i < K; i++) row[i] = (float)c[i] * s;
+        } else {
+            const uint8_t *c = q->codes + (size_t)r * K / 2;
+            const float *s = q->scales + (size_t)r * ng;
+            for (int i = 0; i < K; i += 2) {
+                const uint8_t b = c[i / 2];
+                const int lo = (int)(b & 0x0F) - ((b & 0x08) ? 16 : 0);
+                const int hi = (int)(b >> 4) - ((b & 0x80) ? 16 : 0);
+                row[i] = (float)lo * s[i / g];
+                row[i + 1] = (float)hi * s[(i + 1) / g];
+            }
+        }
+        if (h->reserved[1]) {
+            /* stored W' = W·D·H  ->  W = (W' H) D   (H is symmetric and orthonormal) */
+            eif_hadamard_rotate_f32(row, NULL, K, block);
+            for (int i = 0; i < K; i++) row[i] *= signs[i];
+        }
+    }
+    return 0;
+}
+
+/* FP32 view of projection m of layer l: the stored weight, or dequantised into dst. */
+static const float *siglip_weight(const eif_siglip_t *model, int l, int m, float *dst)
+{
+    const eif_siglip_layer_t *L = &model->layers[l];
+    const float *fp[6] = {L->q_w, L->k_w, L->v_w, L->out_w, L->fc1_w, L->fc2_w};
+    if (model->header.qtype == EIF_SIGLIP_Q_FP32) return fp[m];
+    eif_siglip_dequant_weight(model, l, m, dst);
+    return dst;
 }
 
 static void layer_norm_f32(const float *x, const float *w, const float *b, float *out, int n, float eps)
@@ -646,8 +748,15 @@ int eif_siglip_encode_tile(const eif_siglip_t *model, const float *tile_pixels, 
     float *attn_out = (float *)malloc(SIGLIP_NUM_PATCHES * SIGLIP_HIDDEN_SIZE * sizeof(float));
     float *mlp_h1 = (float *)malloc(SIGLIP_NUM_PATCHES * SIGLIP_INTERM_SIZE * sizeof(float));
     float *grouped = (float *)malloc(SIGLIP_NUM_TOKENS * SIGLIP_CONN_IN * sizeof(float));
+    /* dequantised weights of the current GEMM (3 x 768x768 for q/k/v fits in 3072x768) */
+    float *wbuf = (model->header.qtype != EIF_SIGLIP_Q_FP32)
+                      ? (float *)malloc((size_t)SIGLIP_INTERM_SIZE * SIGLIP_HIDDEN_SIZE * sizeof(float))
+                      : NULL;
+    const size_t wsq = (size_t)SIGLIP_HIDDEN_SIZE * SIGLIP_HIDDEN_SIZE;
 
-    if (!x || !x_norm || !q || !k || !v || !attn_out || !mlp_h1 || !grouped) {
+    if (!x || !x_norm || !q || !k || !v || !attn_out || !mlp_h1 || !grouped ||
+        (model->header.qtype != EIF_SIGLIP_Q_FP32 && !wbuf)) {
+        if (wbuf) free(wbuf);
         if (x) free(x);
         if (x_norm) free(x_norm);
         if (q) free(q);
@@ -702,9 +811,9 @@ int eif_siglip_encode_tile(const eif_siglip_t *model, const float *tile_pixels, 
 
         /* Q, K, V projections */
         siglip_gemm_qkv(gpu, x_norm,
-                        layer->q_w, layer->q_b,
-                        layer->k_w, layer->k_b,
-                        layer->v_w, layer->v_b,
+                        siglip_weight(model, l, 0, wbuf), layer->q_b,
+                        siglip_weight(model, l, 1, wbuf ? wbuf + wsq : NULL), layer->k_b,
+                        siglip_weight(model, l, 2, wbuf ? wbuf + 2 * wsq : NULL), layer->v_b,
                         q, k, v,
                         SIGLIP_NUM_PATCHES, SIGLIP_HIDDEN_SIZE, SIGLIP_HIDDEN_SIZE);
 
@@ -879,7 +988,7 @@ int eif_siglip_encode_tile(const eif_siglip_t *model, const float *tile_pixels, 
         }
 
         /* Out Projection + Residual Add */
-        siglip_gemm_f32(gpu, attn_out, layer->out_w, layer->out_b, x,
+        siglip_gemm_f32(gpu, attn_out, siglip_weight(model, l, 3, wbuf), layer->out_b, x,
                         SIGLIP_NUM_PATCHES, SIGLIP_HIDDEN_SIZE, SIGLIP_HIDDEN_SIZE, true);
 
         /* LayerNorm 2 */
@@ -892,11 +1001,11 @@ int eif_siglip_encode_tile(const eif_siglip_t *model, const float *tile_pixels, 
         }
 
         /* MLP FC1 + GELU */
-        siglip_gemm_f32_gelu(gpu, x_norm, layer->fc1_w, layer->fc1_b, mlp_h1,
+        siglip_gemm_f32_gelu(gpu, x_norm, siglip_weight(model, l, 4, wbuf), layer->fc1_b, mlp_h1,
                              SIGLIP_NUM_PATCHES, SIGLIP_INTERM_SIZE, SIGLIP_HIDDEN_SIZE);
 
         /* MLP FC2 + Residual Add */
-        siglip_gemm_f32(gpu, mlp_h1, layer->fc2_w, layer->fc2_b, x,
+        siglip_gemm_f32(gpu, mlp_h1, siglip_weight(model, l, 5, wbuf), layer->fc2_b, x,
                         SIGLIP_NUM_PATCHES, SIGLIP_HIDDEN_SIZE, SIGLIP_INTERM_SIZE, true);
     }
 
@@ -940,6 +1049,7 @@ int eif_siglip_encode_tile(const eif_siglip_t *model, const float *tile_pixels, 
     free(attn_out);
     free(mlp_h1);
     free(grouped);
+    if (wbuf) free(wbuf);
 
     return 0;
 }

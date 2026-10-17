@@ -1,6 +1,6 @@
 /**
  * @file main.c
- * @brief EIF-Runtime Standalone CLI Runner (eif-run)
+ * @brief bitllm.c standalone CLI runner (bitllm-run; formerly EIF-Runtime eif-run)
  *
  * Fast on-device inference for BitNet b1.58 ternary language models.
  * Supports:
@@ -125,7 +125,7 @@ int main(int argc, char **argv)
     /* Dedicated Embedding Inference Mode */
     if (embed_text != NULL) {
         printf("=================================================================\n");
-        printf("  EIF-Runtime (Edge-Intelligence Fast Inference Engine v%s)\n", EIF_RUNTIME_VERSION_STRING);
+        printf("  bitllm.c (formerly EIF-Runtime) v%s\n", EIF_RUNTIME_VERSION_STRING);
         printf("=================================================================\n");
         printf("  • Model File  : %s\n", model_path);
         printf("  • Mode        : Dense Semantic Vector Embedding\n");
@@ -193,7 +193,7 @@ int main(int argc, char **argv)
     }
 
     printf("=================================================================\n");
-    printf("  EIF-Runtime (Edge-Intelligence Fast Inference Engine v%s)\n", EIF_RUNTIME_VERSION_STRING);
+    printf("  bitllm.c (formerly EIF-Runtime) v%s\n", EIF_RUNTIME_VERSION_STRING);
     printf("=================================================================\n");
     printf("  • Model File  : %s\n", model_path);
     if (image_path != NULL) {
