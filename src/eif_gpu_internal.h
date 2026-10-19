@@ -50,7 +50,7 @@ typedef struct {
     float scale_log2;
 } eif_gpu_attn_pc_t;
 
-/* Fused attention needs ~35 KB of shared memory; false if the device cannot run a kernel. */
+/* Fused attention needs 44 KB of shared memory and subgroup shuffles; false if the device cannot run a kernel. */
 bool eif_gpu_kernel_available(const eif_gpu_context_t *ctx, int kernel);
 
 /* host_visible: mapped, coherent (prefers device-local); otherwise device-local, filled via staging. */

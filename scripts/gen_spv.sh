@@ -20,7 +20,7 @@ layernorm     layernorm.comp
 softmax       softmax.comp
 bcast         bcast.comp
 merge         merge.comp
-attention     attention.comp
+attention     attention.comp --target-env vulkan1.1
 "
 
 {
@@ -34,7 +34,9 @@ attention     attention.comp
 echo "$VARIANTS" | while read -r name src defs; do
     [ -n "$name" ] || continue
     # shellcheck disable=SC2086
-    "$GLSLANG" -V --target-env vulkan1.0 $defs -o "$TMP/$name.spv" "$ROOT/shaders/$src" >"$TMP/log" || { cat "$TMP/log" >&2; exit 1; }
+    case "$defs" in *--target-env*) env="" ;; *) env="--target-env vulkan1.0" ;; esac
+    # shellcheck disable=SC2086
+    "$GLSLANG" -V $env $defs -o "$TMP/$name.spv" "$ROOT/shaders/$src" >"$TMP/log" || { cat "$TMP/log" >&2; exit 1; }
     python3 - "$TMP/$name.spv" "$name" >> "$TMP/hdr" <<'PY'
 import struct, sys
 data = open(sys.argv[1], 'rb').read()

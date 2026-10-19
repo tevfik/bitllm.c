@@ -71,6 +71,7 @@ typedef struct {
     VkDeviceSize max_range;
     uint32_t max_groups[3];
     uint32_t max_shared;
+    bool subgroup_shuffle8;
     VkCommandPool cmd_pool;
     VkCommandBuffer cmd;
     VkFence fence;
@@ -390,7 +391,8 @@ static bool vk_create_pipelines(vk_state_t *s)
         [EIF_GPU_K_MERGE] = {eif_spv_merge, sizeof(eif_spv_merge)},
         [EIF_GPU_K_ATTENTION] = {eif_spv_attention, sizeof(eif_spv_attention)},
     };
-    static const uint32_t shared_bytes[EIF_GPU_K_COUNT] = { [EIF_GPU_K_ATTENTION] = 36 * 1024 };
+    /* optional kernels: shared memory need, and attention also needs 8-lane-aligned subgroup shuffles */
+    static const uint32_t shared_bytes[EIF_GPU_K_COUNT] = { [EIF_GPU_K_ATTENTION] = 44 * 1024 };
     VkDescriptorSetLayoutBinding b[EIF_VK_NBIND];
     for (int i = 0; i < EIF_VK_NBIND; i++) {
         b[i].binding = (uint32_t)i;
@@ -415,7 +417,7 @@ static bool vk_create_pipelines(vk_state_t *s)
     };
     if (s->vkCreatePipelineLayout(s->device, &pli, NULL, &s->pl) != VK_SUCCESS) return false;
     for (int k = 0; k < EIF_GPU_K_COUNT; k++) {
-        if (shared_bytes[k] > s->max_shared) continue; /* optional kernel, callers check availability */
+        if (shared_bytes[k] > s->max_shared || (k == EIF_GPU_K_ATTENTION && !s->subgroup_shuffle8)) continue;
         VkShaderModuleCreateInfo smi = {
             .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
             .codeSize = spv[k].size,
@@ -501,13 +503,19 @@ static bool vk_init_state(eif_gpu_context_t *ctx, vk_state_t *s)
         (PFN_vkCreateInstance)s->vkGetInstanceProcAddr(VK_NULL_HANDLE, "vkCreateInstance");
     if (!create_instance) return false;
 
+    /* Vulkan 1.1 when the loader has it (subgroup queries for the fused attention kernel) */
+    uint32_t api = VK_API_VERSION_1_0;
+    PFN_vkEnumerateInstanceVersion inst_version =
+        (PFN_vkEnumerateInstanceVersion)s->vkGetInstanceProcAddr(VK_NULL_HANDLE, "vkEnumerateInstanceVersion");
+    if (inst_version && inst_version(&api) != VK_SUCCESS) api = VK_API_VERSION_1_0;
+    api = api >= VK_API_VERSION_1_1 ? VK_API_VERSION_1_1 : VK_API_VERSION_1_0;
     VkApplicationInfo app = {
         .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
         .pApplicationName = "bitllm.c",
         .applicationVersion = VK_MAKE_VERSION(1, 0, 0),
         .pEngineName = "bitllm.c",
         .engineVersion = VK_MAKE_VERSION(1, 0, 0),
-        .apiVersion = VK_API_VERSION_1_0,
+        .apiVersion = api,
     };
     VkInstanceCreateInfo ici = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app };
     if (create_instance(&ici, NULL, &s->instance) != VK_SUCCESS) {
@@ -562,6 +570,19 @@ static bool vk_init_state(eif_gpu_context_t *ctx, vk_state_t *s)
     s->max_range = props.limits.maxStorageBufferRange;
     for (int i = 0; i < 3; i++) s->max_groups[i] = props.limits.maxComputeWorkGroupCount[i];
     s->max_shared = props.limits.maxComputeSharedMemorySize;
+    if (api >= VK_API_VERSION_1_1 && props.apiVersion >= VK_API_VERSION_1_1) {
+        PFN_vkGetPhysicalDeviceProperties2 props2 =
+            (PFN_vkGetPhysicalDeviceProperties2)s->vkGetInstanceProcAddr(s->instance, "vkGetPhysicalDeviceProperties2");
+        if (props2) {
+            VkPhysicalDeviceSubgroupProperties sg = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES };
+            VkPhysicalDeviceProperties2 p2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &sg };
+            props2(s->phys, &p2);
+            const VkSubgroupFeatureFlags need = VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_SHUFFLE_BIT;
+            s->subgroup_shuffle8 = (sg.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) &&
+                                   (sg.supportedOperations & need) == need && sg.subgroupSize >= 8 &&
+                                   sg.subgroupSize <= 256 && (256 % sg.subgroupSize) == 0;
+        }
+    }
     if (props.limits.maxPushConstantsSize < 128 || props.limits.maxComputeWorkGroupInvocations < 256 ||
         props.limits.maxComputeSharedMemorySize < 16384)
         return false;
