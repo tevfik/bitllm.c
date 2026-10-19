@@ -92,6 +92,7 @@ static void init_dense_lut(void) {
 }
 
 #include "eif_quantize_bitnet.h"
+#include "eif_tinyllm.h"
 
 static inline size_t row_bytes(int cols, int quant_type) {
     if (quant_type == QWEN35_QTYPE_BITNET_DENSE) return (size_t)(cols + 4) / 5;
@@ -156,8 +157,61 @@ static void bitnet_gemv_dense(float *out, const uint8_t *W, const float *sc,
     }
 }
 
+#if defined(__aarch64__) && defined(__linux__)
+#include <arm_neon.h>
+#include <sys/auxv.h>
+#ifndef HWCAP_ASIMDDP
+#define HWCAP_ASIMDDP (1 << 20)
+#endif
+static int q35_has_dotprod(void)
+{
+    static int cached = -1;
+    if (cached < 0) cached = (getauxval(AT_HWCAP) & HWCAP_ASIMDDP) ? 1 : 0;
+    return cached;
+}
+
+/* INT4 (even col = high nibble, value - 8) x Q8 activations (one scale per 32 inputs), SDOT per block.
+ * Requires cols % 32 == 0. */
+__attribute__((target("+dotprod")))
+static void int4_gemv_dot(float *out, const uint8_t *W, const float *sc, const float *x, int rows, int cols)
+{
+    int nb = cols / 32, pcols = cols / 2;
+    int8_t xq[cols] __attribute__((aligned(16)));
+    float xs[nb];
+    for (int b = 0; b < nb; b++) {
+        const float *xb = x + b * 32;
+        float32x4_t m = vdupq_n_f32(0.0f);
+        for (int i = 0; i < 32; i += 4) m = vmaxq_f32(m, vabsq_f32(vld1q_f32(xb + i)));
+        float amax = vmaxvq_f32(m), id = amax > 0.0f ? 127.0f / amax : 0.0f;
+        xs[b] = amax / 127.0f;
+        for (int i = 0; i < 32; i++) xq[b * 32 + i] = (int8_t)lrintf(xb[i] * id);
+    }
+    const int8x16_t eight = vdupq_n_s8(8);
+    #pragma omp parallel for schedule(static)
+    for (int r = 0; r < rows; r++) {
+        const uint8_t *row = W + (size_t)r * pcols;
+        float32x4_t f = vdupq_n_f32(0.0f);
+        for (int b = 0; b < nb; b++) {
+            uint8x16_t wb = vld1q_u8(row + b * 16);
+            int8x16_t hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(wb, 4)), eight);
+            int8x16_t lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(wb, vdupq_n_u8(0x0F))), eight);
+            int8x16x2_t xv = vld2q_s8(xq + b * 32); /* val[0] = even columns, val[1] = odd */
+            int32x4_t acc = vdotq_s32(vdotq_s32(vdupq_n_s32(0), hi, xv.val[0]), lo, xv.val[1]);
+            f = vfmaq_n_f32(f, vcvtq_f32_s32(acc), xs[b]);
+        }
+        out[r] = sc[r] * vaddvq_f32(f);
+    }
+}
+#endif
+
 static void int4_gemv(float *out, const uint8_t *W, const float *sc,
                       const float *x, int rows, int cols) {
+#if defined(__aarch64__) && defined(__linux__)
+    if (cols % 32 == 0 && q35_has_dotprod() && !getenv("BITLLM_INT8_F32")) {
+        int4_gemv_dot(out, W, sc, x, rows, cols);
+        return;
+    }
+#endif
     int pcols = (cols + 1) / 2;
     #pragma omp parallel for schedule(static)
     for (int r = 0; r < rows; r++) {
@@ -243,6 +297,10 @@ static void f32_gemv(float *out, const float *W, const float *b_vec,
 /* INT8 GEMV (LM head): signed per-row scaled integer weights. */
 static void int8_gemv(float *out, const int8_t *W, const float *sc,
                       const float *x, int rows, int cols) {
+#if defined(__aarch64__) || defined(__ARM_NEON)
+    tinyllm_matmul_int8_rowscale(out, W, x, cols, rows, sc);
+    return;
+#endif
     #pragma omp parallel for schedule(static)
     for (int r = 0; r < rows; r++) {
         const int8_t *row = W + (size_t)r * cols;
