@@ -22,6 +22,13 @@ extern "C" {
 void eif_gemm_f32_nt(const float *A, const float *W, const float *bias, float *C,
                      int M, int N, int K, int act, int accumulate);
 
+/** As eif_gemm_f32_nt with explicit row strides (in floats) for A, W and C. */
+void eif_gemm_f32_nt_ld(const float *A, int lda, const float *W, int ldw, const float *bias, float *C, int ldc,
+                        int M, int N, int K, int act, int accumulate);
+
+/** Row-wise softmax(scale * S[r, :cols]) in place (scale > 0); rows are ld floats apart. */
+void eif_softmax_rows_f32(float *S, int rows, int cols, int ld, float scale);
+
 #ifdef __cplusplus
 }
 #endif

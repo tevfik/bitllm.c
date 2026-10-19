@@ -432,13 +432,15 @@ int eif_siglip_encode_tile(const eif_siglip_t *model, const float *tile_pixels, 
     float *attn_out = (float *)malloc(SIGLIP_NUM_PATCHES * SIGLIP_HIDDEN_SIZE * sizeof(float));
     float *mlp_h1 = (float *)malloc(SIGLIP_NUM_PATCHES * SIGLIP_INTERM_SIZE * sizeof(float));
     float *grouped = (float *)malloc(SIGLIP_NUM_TOKENS * SIGLIP_CONN_IN * sizeof(float));
+    float *scores = (float *)malloc((size_t)SIGLIP_NUM_PATCHES * SIGLIP_NUM_PATCHES * sizeof(float));
+    float *v_t = (float *)malloc((size_t)SIGLIP_HEAD_DIM * SIGLIP_NUM_PATCHES * sizeof(float));
     /* dequantised weights of the current GEMM (3 x 768x768 for q/k/v fits in 3072x768) */
     float *wbuf = (model->header.qtype != EIF_SIGLIP_Q_FP32)
                       ? (float *)malloc((size_t)SIGLIP_INTERM_SIZE * SIGLIP_HIDDEN_SIZE * sizeof(float))
                       : NULL;
     const size_t wsq = (size_t)SIGLIP_HIDDEN_SIZE * SIGLIP_HIDDEN_SIZE;
 
-    if (!x || !x_norm || !q || !k || !v || !attn_out || !mlp_h1 || !grouped ||
+    if (!x || !x_norm || !q || !k || !v || !attn_out || !mlp_h1 || !grouped || !scores || !v_t ||
         (model->header.qtype != EIF_SIGLIP_Q_FP32 && !wbuf)) {
         if (wbuf) free(wbuf);
         if (x) free(x);
@@ -449,6 +451,8 @@ int eif_siglip_encode_tile(const eif_siglip_t *model, const float *tile_pixels, 
         if (attn_out) free(attn_out);
         if (mlp_h1) free(mlp_h1);
         if (grouped) free(grouped);
+        free(scores);
+        free(v_t);
         return -2;
     }
 
@@ -501,174 +505,22 @@ int eif_siglip_encode_tile(const eif_siglip_t *model, const float *tile_pixels, 
                         q, k, v,
                         SIGLIP_NUM_PATCHES, SIGLIP_HIDDEN_SIZE, SIGLIP_HIDDEN_SIZE);
 
-        /* Multi-Head Attention: 12 heads, head_dim 64, scale = 1/8 = 0.125f */
+        /* Multi-Head Attention: 12 heads, head_dim 64, scale = 1/8 = 0.125f.
+         * Per head: S = Q_h K_h^T (GEMM), row softmax, O_h = S V_h (GEMM against V_h^T). */
         const float attn_scale = 1.0f / sqrtf((float)SIGLIP_HEAD_DIM);
-        #pragma omp parallel for collapse(2) schedule(dynamic, 8) if(!omp_in_parallel())
         for (int h = 0; h < SIGLIP_NUM_HEADS; h++) {
-            for (int i = 0; i < SIGLIP_NUM_PATCHES; i++) {
-                int h_off = h * SIGLIP_HEAD_DIM;
-                float local_scores[SIGLIP_NUM_PATCHES];
-                const float *qi = q + (size_t)i * SIGLIP_HIDDEN_SIZE + h_off;
-
-#if defined(__AVX512F__)
-                __m512 qv[4];
-                for (int d = 0; d < 4; d++) qv[d] = _mm512_loadu_ps(qi + d * 16);
-
-                float max_s = -1e30f;
-                for (int j = 0; j < SIGLIP_NUM_PATCHES; j++) {
-                    const float *kj = k + (size_t)j * SIGLIP_HIDDEN_SIZE + h_off;
-                    __m512 acc0 = _mm512_mul_ps(qv[0], _mm512_loadu_ps(kj + 0));
-                    acc0 = _mm512_fmadd_ps(qv[1], _mm512_loadu_ps(kj + 16), acc0);
-                    acc0 = _mm512_fmadd_ps(qv[2], _mm512_loadu_ps(kj + 32), acc0);
-                    acc0 = _mm512_fmadd_ps(qv[3], _mm512_loadu_ps(kj + 48), acc0);
-                    float s = _mm512_reduce_add_ps(acc0) * attn_scale;
-                    local_scores[j] = s;
-                    if (s > max_s) max_s = s;
-                }
-
-                float sum_exp = 0.0f;
-                for (int j = 0; j < SIGLIP_NUM_PATCHES; j++) {
-                    float ev = expf(local_scores[j] - max_s);
-                    local_scores[j] = ev;
-                    sum_exp += ev;
-                }
-                float inv_sum = 1.0f / sum_exp;
-
-                __m512 o[4] = {_mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps()};
-                for (int j = 0; j < SIGLIP_NUM_PATCHES; j++) {
-                    __m512 vs = _mm512_set1_ps(local_scores[j] * inv_sum);
-                    const float *vj = v + (size_t)j * SIGLIP_HIDDEN_SIZE + h_off;
-                    for (int d = 0; d < 4; d++) {
-                        o[d] = _mm512_fmadd_ps(vs, _mm512_loadu_ps(vj + d * 16), o[d]);
-                    }
-                }
-                float *out_ih = attn_out + (size_t)i * SIGLIP_HIDDEN_SIZE + h_off;
-                for (int d = 0; d < 4; d++) {
-                    _mm512_storeu_ps(out_ih + d * 16, o[d]);
-                }
-
-#elif defined(__AVX2__)
-                __m256 qv[8];
-                for (int d = 0; d < 8; d++) qv[d] = _mm256_loadu_ps(qi + d * 8);
-
-                float max_s = -1e30f;
-                for (int j = 0; j < SIGLIP_NUM_PATCHES; j++) {
-                    const float *kj = k + (size_t)j * SIGLIP_HIDDEN_SIZE + h_off;
-                    __m256 acc0 = _mm256_mul_ps(qv[0], _mm256_loadu_ps(kj + 0));
-                    __m256 acc1 = _mm256_mul_ps(qv[1], _mm256_loadu_ps(kj + 8));
-                    for (int d = 2; d < 8; d += 2) {
-                        acc0 = _mm256_fmadd_ps(qv[d + 0], _mm256_loadu_ps(kj + (d + 0) * 8), acc0);
-                        acc1 = _mm256_fmadd_ps(qv[d + 1], _mm256_loadu_ps(kj + (d + 1) * 8), acc1);
-                    }
-                    acc0 = _mm256_add_ps(acc0, acc1);
-                    __m128 lo = _mm256_castps256_ps128(acc0);
-                    __m128 hi = _mm256_extractf128_ps(acc0, 1);
-                    __m128 sum = _mm_add_ps(lo, hi);
-                    sum = _mm_hadd_ps(sum, sum);
-                    sum = _mm_hadd_ps(sum, sum);
-                    float s = _mm_cvtss_f32(sum) * attn_scale;
-                    local_scores[j] = s;
-                    if (s > max_s) max_s = s;
-                }
-
-                float sum_exp = 0.0f;
-                for (int j = 0; j < SIGLIP_NUM_PATCHES; j++) {
-                    float ev = expf(local_scores[j] - max_s);
-                    local_scores[j] = ev;
-                    sum_exp += ev;
-                }
-                float inv_sum = 1.0f / sum_exp;
-
-                __m256 o[8];
-                for (int d = 0; d < 8; d++) o[d] = _mm256_setzero_ps();
-                for (int j = 0; j < SIGLIP_NUM_PATCHES; j++) {
-                    __m256 vs = _mm256_set1_ps(local_scores[j] * inv_sum);
-                    const float *vj = v + (size_t)j * SIGLIP_HIDDEN_SIZE + h_off;
-                    for (int d = 0; d < 8; d++) {
-                        o[d] = _mm256_fmadd_ps(vs, _mm256_loadu_ps(vj + d * 8), o[d]);
-                    }
-                }
-                float *out_ih = attn_out + (size_t)i * SIGLIP_HIDDEN_SIZE + h_off;
-                for (int d = 0; d < 8; d++) {
-                    _mm256_storeu_ps(out_ih + d * 8, o[d]);
-                }
-
-#elif defined(__ARM_NEON) || defined(__aarch64__)
-                float32x4_t qv[16];
-                for (int d = 0; d < 16; d++) qv[d] = vld1q_f32(qi + d * 4);
-
-                float max_s = -1e30f;
-                for (int j = 0; j < SIGLIP_NUM_PATCHES; j++) {
-                    const float *kj = k + (size_t)j * SIGLIP_HIDDEN_SIZE + h_off;
-                    float32x4_t acc0 = vmulq_f32(qv[0], vld1q_f32(kj + 0));
-                    float32x4_t acc1 = vmulq_f32(qv[1], vld1q_f32(kj + 4));
-                    float32x4_t acc2 = vmulq_f32(qv[2], vld1q_f32(kj + 8));
-                    float32x4_t acc3 = vmulq_f32(qv[3], vld1q_f32(kj + 12));
-                    for (int d = 4; d < 16; d += 4) {
-                        acc0 = vfmaq_f32(acc0, qv[d + 0], vld1q_f32(kj + (d + 0) * 4));
-                        acc1 = vfmaq_f32(acc1, qv[d + 1], vld1q_f32(kj + (d + 1) * 4));
-                        acc2 = vfmaq_f32(acc2, qv[d + 2], vld1q_f32(kj + (d + 2) * 4));
-                        acc3 = vfmaq_f32(acc3, qv[d + 3], vld1q_f32(kj + (d + 3) * 4));
-                    }
-                    acc0 = vaddq_f32(acc0, acc1);
-                    acc2 = vaddq_f32(acc2, acc3);
-                    acc0 = vaddq_f32(acc0, acc2);
-                    float s = vaddvq_f32(acc0) * attn_scale;
-                    local_scores[j] = s;
-                    if (s > max_s) max_s = s;
-                }
-
-                float sum_exp = 0.0f;
-                for (int j = 0; j < SIGLIP_NUM_PATCHES; j++) {
-                    float ev = expf(local_scores[j] - max_s);
-                    local_scores[j] = ev;
-                    sum_exp += ev;
-                }
-                float inv_sum = 1.0f / sum_exp;
-
-                float32x4_t o[16];
-                for (int d = 0; d < 16; d++) o[d] = vdupq_n_f32(0.0f);
-
-                for (int j = 0; j < SIGLIP_NUM_PATCHES; j++) {
-                    float32x4_t vs = vdupq_n_f32(local_scores[j] * inv_sum);
-                    const float *vj = v + (size_t)j * SIGLIP_HIDDEN_SIZE + h_off;
-                    for (int d = 0; d < 16; d++) {
-                        o[d] = vfmaq_f32(o[d], vs, vld1q_f32(vj + d * 4));
-                    }
-                }
-
-                float *out_ih = attn_out + (size_t)i * SIGLIP_HIDDEN_SIZE + h_off;
-                for (int d = 0; d < 16; d++) {
-                    vst1q_f32(out_ih + d * 4, o[d]);
-                }
-#else
-                float max_s = -1e30f;
-                for (int j = 0; j < SIGLIP_NUM_PATCHES; j++) {
-                    const float *kj = k + (size_t)j * SIGLIP_HIDDEN_SIZE + h_off;
-                    float s = dot_f32_simd(qi, kj, SIGLIP_HEAD_DIM) * attn_scale;
-                    local_scores[j] = s;
-                    if (s > max_s) max_s = s;
-                }
-
-                float sum_exp = 0.0f;
-                for (int j = 0; j < SIGLIP_NUM_PATCHES; j++) {
-                    float ev = expf(local_scores[j] - max_s);
-                    local_scores[j] = ev;
-                    sum_exp += ev;
-                }
-                float inv_sum = 1.0f / sum_exp;
-
-                float *out_ih = attn_out + (size_t)i * SIGLIP_HIDDEN_SIZE + h_off;
-                memset(out_ih, 0, SIGLIP_HEAD_DIM * sizeof(float));
-                for (int j = 0; j < SIGLIP_NUM_PATCHES; j++) {
-                    float s = local_scores[j] * inv_sum;
-                    const float *vj = v + (size_t)j * SIGLIP_HIDDEN_SIZE + h_off;
-                    for (int d = 0; d < SIGLIP_HEAD_DIM; d++) {
-                        out_ih[d] += s * vj[d];
-                    }
-                }
-#endif
-            }
+            int h_off = h * SIGLIP_HEAD_DIM;
+            eif_gemm_f32_nt_ld(q + h_off, SIGLIP_HIDDEN_SIZE, k + h_off, SIGLIP_HIDDEN_SIZE, NULL,
+                               scores, SIGLIP_NUM_PATCHES, SIGLIP_NUM_PATCHES, SIGLIP_NUM_PATCHES,
+                               SIGLIP_HEAD_DIM, EIF_GEMM_ACT_NONE, 0);
+            eif_softmax_rows_f32(scores, SIGLIP_NUM_PATCHES, SIGLIP_NUM_PATCHES, SIGLIP_NUM_PATCHES, attn_scale);
+            #pragma omp parallel for schedule(static) if(!omp_in_parallel())
+            for (int d = 0; d < SIGLIP_HEAD_DIM; d++)
+                for (int j = 0; j < SIGLIP_NUM_PATCHES; j++)
+                    v_t[(size_t)d * SIGLIP_NUM_PATCHES + j] = v[(size_t)j * SIGLIP_HIDDEN_SIZE + h_off + d];
+            eif_gemm_f32_nt_ld(scores, SIGLIP_NUM_PATCHES, v_t, SIGLIP_NUM_PATCHES, NULL,
+                               attn_out + h_off, SIGLIP_HIDDEN_SIZE, SIGLIP_NUM_PATCHES, SIGLIP_HEAD_DIM,
+                               SIGLIP_NUM_PATCHES, EIF_GEMM_ACT_NONE, 0);
         }
 
         /* Out Projection + Residual Add */
