@@ -721,6 +721,7 @@ int eif_llm_generate_vision_docling(eif_llm_t *llm, const char *image_path, cons
     /* 1. Try precomputed visual embeddings (.vis.bin), or encode directly via native SigLIP2 */
     float *vis_embeds = NULL;
     int num_vis_tokens = 0;
+    int grid_rows = 4, grid_cols = 3; /* precomputed .vis.bin files use the legacy 4 x 3 + global layout */
 
     char vis_path[2048];
     snprintf(vis_path, sizeof(vis_path), "%s.vis.bin", image_path);
@@ -769,13 +770,14 @@ int eif_llm_generate_vision_docling(eif_llm_t *llm, const char *image_path, cons
                         fflush(stderr);
 
                         clock_gettime(CLOCK_MONOTONIC, &t_v0);
-                        vis_embeds = (float *)malloc(832 * 576 * sizeof(float));
-                        if (vis_embeds && eif_siglip_encode_image(&siglip, image_path, vis_embeds) == 0) {
+                        vis_embeds = (float *)malloc((size_t)EIF_SIGLIP_MAX_TILES * 64 * 576 * sizeof(float));
+                        if (vis_embeds && eif_siglip_encode_image(&siglip, image_path, vis_embeds, &grid_rows, &grid_cols) == 0) {
                             clock_gettime(CLOCK_MONOTONIC, &t_v1);
                             double enc_sec = (t_v1.tv_sec - t_v0.tv_sec) + (t_v1.tv_nsec - t_v0.tv_nsec) * 1e-9;
-                            fprintf(stderr, "  • Vision ViT Encode Complete in %.2fs (%.2fs / tile)\n", enc_sec, enc_sec / 13.0);
+                            int n_tiles = grid_rows * grid_cols + 1;
+                            fprintf(stderr, "  • Vision ViT Encode Complete in %.2fs (%.2fs / tile)\n", enc_sec, enc_sec / n_tiles);
                             fflush(stderr);
-                            num_vis_tokens = 832;
+                            num_vis_tokens = n_tiles * 64;
                         } else {
                             if (vis_embeds) { free(vis_embeds); vis_embeds = NULL; }
                         }
@@ -787,7 +789,8 @@ int eif_llm_generate_vision_docling(eif_llm_t *llm, const char *image_path, cons
         }
     }
 
-    if (!vis_embeds || num_vis_tokens != 832) {
+    if (!vis_embeds || num_vis_tokens != (grid_rows * grid_cols + 1) * 64 || grid_rows < 1 || grid_rows > 4 ||
+        grid_cols < 1 || grid_cols > 4) {
         fprintf(stderr, "[EIF LLM Error] Visual embeddings could not be generated or loaded for '%s'\n", image_path);
         if (vis_embeds) free(vis_embeds);
         return -3;
@@ -832,21 +835,21 @@ int eif_llm_generate_vision_docling(eif_llm_t *llm, const char *image_path, cons
         total_prompt_tokens++;
     }
 
-    /* 2. Grid 4x3 = 12 local tiles */
-    int grid_tokens[4][3] = {
-        {100258, 100259, 100261},
-        {100263, 100267, 100268},
-        {100342, 100343, 100344},
-        {100346, 100347, 100348}
+    /* 2. Local tiles, row-major: <fake_token_around_image><row_r_col_c> + 64 image tokens, "\n" after each row */
+    static const int row_col_tokens[4][4] = {
+        {100258, 100259, 100261, 100262},
+        {100263, 100267, 100268, 100341},
+        {100342, 100343, 100344, 100345},
+        {100346, 100347, 100348, 100349}
     };
 
     int tile_idx = 0;
-    for (int r = 0; r < 4; r++) {
-        for (int c = 0; c < 3; c++) {
+    for (int r = 0; r < grid_rows; r++) {
+        for (int c = 0; c < grid_cols; c++) {
             tinyllm_get_token_embedding(&llm->backend.tinyllm, 100339, batch_embeddings + (size_t)total_prompt_tokens * dim);
             total_prompt_tokens++;
 
-            tinyllm_get_token_embedding(&llm->backend.tinyllm, grid_tokens[r][c], batch_embeddings + (size_t)total_prompt_tokens * dim);
+            tinyllm_get_token_embedding(&llm->backend.tinyllm, row_col_tokens[r][c], batch_embeddings + (size_t)total_prompt_tokens * dim);
             total_prompt_tokens++;
 
             const float *emb_tile = vis_embeds + (size_t)tile_idx * 64 * 576;
@@ -855,7 +858,7 @@ int eif_llm_generate_vision_docling(eif_llm_t *llm, const char *image_path, cons
 
             tile_idx++;
         }
-        if (r < 3) {
+        if (r < grid_rows - 1) {
             tinyllm_get_token_embedding(&llm->backend.tinyllm, 198, batch_embeddings + (size_t)total_prompt_tokens * dim);
             total_prompt_tokens++;
         }
@@ -871,16 +874,29 @@ int eif_llm_generate_vision_docling(eif_llm_t *llm, const char *image_path, cons
     tinyllm_get_token_embedding(&llm->backend.tinyllm, 100340, batch_embeddings + (size_t)total_prompt_tokens * dim);
     total_prompt_tokens++;
 
-    const float *emb_global = vis_embeds + (size_t)12 * 64 * 576;
+    const float *emb_global = vis_embeds + (size_t)(grid_rows * grid_cols) * 64 * 576;
     memcpy(batch_embeddings + (size_t)total_prompt_tokens * dim, emb_global, (size_t)64 * 576 * sizeof(float));
     total_prompt_tokens += 64;
 
     tinyllm_get_token_embedding(&llm->backend.tinyllm, 100339, batch_embeddings + (size_t)total_prompt_tokens * dim);
     total_prompt_tokens++;
 
-    /* 4. Suffix tokens: Convert this page to docling.<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|> */
-    int suffix_tokens[] = {12281, 420, 2199, 311, 4733, 2785, 13, 100257, 198, 100264, 78191, 100265};
-    int n_suffix = sizeof(suffix_tokens) / sizeof(suffix_tokens[0]);
+    /* 4. Suffix: <prompt text><|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>
+     * The prompt selects the task (e.g. "Convert this page to docling.", "Convert table to OTSL.",
+     * "Convert chart to table."); an empty prompt falls back to the page prompt. */
+    int32_t suffix_tokens[1024];
+    int n_suffix = 0;
+    const char *task_prompt = (prompt && prompt[0]) ? prompt : "Convert this page to docling.";
+    int n_prompt = eif_bpe_tokenizer_encode(&llm->tokenizer, task_prompt, 0, 0, suffix_tokens, 1024 - 8);
+    if (n_prompt <= 0) {
+        fprintf(stderr, "[EIF LLM Error] Could not tokenize prompt '%s'\n", task_prompt);
+        free(batch_embeddings);
+        free(vis_embeds);
+        return -4;
+    }
+    n_suffix = n_prompt;
+    static const int32_t suffix_tail[] = {100257, 198, 100264, 78191, 100265};
+    for (size_t i = 0; i < sizeof(suffix_tail) / sizeof(suffix_tail[0]); i++) suffix_tokens[n_suffix++] = suffix_tail[i];
     for (int i = 0; i < n_suffix; i++) {
         tinyllm_get_token_embedding(&llm->backend.tinyllm, suffix_tokens[i], batch_embeddings + (size_t)total_prompt_tokens * dim);
         if (total_history < 4096) history_tokens[total_history++] = suffix_tokens[i];

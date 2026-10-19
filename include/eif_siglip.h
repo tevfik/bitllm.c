@@ -9,7 +9,7 @@
  * - 12 Transformer encoder layers (Multi-Head Self-Attention + MLP with tanh-GELU)
  * - Post LayerNorm
  * - 4x4 spatial patch merging (12,288 features) -> 576-dim linear connector projection
- * - Generates exact 64 visual tokens per tile (832 visual tokens for 13 tiles)
+ * - Generates exact 64 visual tokens per tile (64 per tile; 5 to 17 tiles per image)
  *
  * Fully self-contained pure C99 with ZERO Python, PyTorch, or external dependencies.
  */
@@ -162,21 +162,48 @@ void eif_siglip_free(eif_siglip_t *model);
  */
 int eif_siglip_encode_tile(const eif_siglip_t *model, const float *tile_pixels, float *out_tokens);
 
+/** Largest tile count the Idefics3 pipeline can produce: 4 x 4 grid + 1 global view. */
+#define EIF_SIGLIP_MAX_TILES 17
+
 /**
- * @brief Encode an arbitrary image file (.png, .jpg, etc.) directly into 832 visual tokens [832, 576].
+ * @brief Grid chosen by the Idefics3 image processor for an image of the given size.
+ *
+ * The longest edge is scaled to 2048 (small images are enlarged) and both sides are rounded up to
+ * multiples of 512, so rows, cols are in 1..4 and the tile count is rows * cols + 1 (5..17).
+ * Examples: 768x1024 -> 4 x 3, 449x92 -> 1 x 4, 1275x1650 -> 4 x 4.
+ *
+ * @return 0 on success, -1 for a non-positive size.
+ */
+int eif_siglip_plan_tiles(int img_w, int img_h, int *rows, int *cols);
+
+/**
+ * @brief Load an image and produce the normalised 512x512 tiles ((v/255 - 0.5) / 0.5, CHW, row-major
+ *        tiles followed by the global view), identical in layout to transformers' Idefics3ImageProcessor.
+ *
+ * @param out_tiles Receives a malloc'd buffer of (rows * cols + 1) * 3 * 512 * 512 floats (caller frees).
+ * @return 0 on success, negative error code on failure.
+ */
+int eif_siglip_preprocess_image(const char *image_path, float **out_tiles, int *rows, int *cols);
+
+/**
+ * @brief Encode an arbitrary image file (.png, .jpg, etc.) directly into visual tokens.
  *
  * Implements the full Idefics3/Docling document image pipeline:
  * - Reads image via stb_image
- * - Generates 12 local tiles (4 rows x 3 columns grid) + 1 global overview tile = 13 tiles
- * - Runs ViT and patch merge + connector on each tile
- * - Output shape: 832 tokens x 576 dimensions
+ * - Splits it into a rows x cols grid of tiles chosen from the aspect ratio (see eif_siglip_plan_tiles)
+ *   plus one global overview tile
+ * - Runs ViT and patch merge + connector on each tile (64 tokens per tile, dim 576)
  *
  * @param model Initialized SigLIP model.
  * @param image_path Path to image file.
- * @param out_tokens Output buffer of size 832 * 576 * sizeof(float) (approx 1.83 MB).
+ * @param out_tokens Output buffer of EIF_SIGLIP_MAX_TILES * 64 * 576 floats (about 2.5 MB); the first
+ *        (rows * cols + 1) * 64 tokens are written, the global tile last.
+ * @param out_rows Receives the grid rows (may be NULL).
+ * @param out_cols Receives the grid columns (may be NULL).
  * @return 0 on success, negative error code on failure.
  */
-int eif_siglip_encode_image(const eif_siglip_t *model, const char *image_path, float *out_tokens);
+int eif_siglip_encode_image(const eif_siglip_t *model, const char *image_path, float *out_tokens,
+                            int *out_rows, int *out_cols);
 
 #ifdef __cplusplus
 }

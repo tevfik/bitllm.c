@@ -38,13 +38,15 @@ static void print_usage(const char *prog)
     printf("Usage:\n");
     printf("  %s <model_path> [prompt] [max_tokens] [tokenizer.bin] [options]\n\n", prog);
     printf("Options:\n");
+    printf("  -m, --model <path>       Model file (same as the first positional argument)\n");
+    printf("  -i, --image <path>       Document image for vision models (Granite-Docling)\n");
     printf("  -p, --prompt <str>       Input prompt text for generative LLMs\n");
     printf("  -e, --embed <str>        Compute dense embeddings for text (BERT / Granite / E5)\n");
     printf("  -n, --max-tokens <int>   Maximum new tokens to generate (default: 64)\n");
     printf("  -t, --tokenizer <path>   Path to custom tokenizer.bin\n");
-    printf("  -T, --temp <float>       Sampling temperature (default: 0.7, 0.0=argmax)\n");
+    printf("  -T, --temp <float>       Sampling temperature (default: 0.7, 0.0=argmax; 0.0 with --image)\n");
     printf("  --top-p <float>          Nucleus top-p threshold (default: 0.9)\n");
-    printf("  -r, --rep-penalty <val>  Repetition penalty factor (default: 1.15, 1.0=none)\n");
+    printf("  -r, --rep-penalty <val>  Repetition penalty factor (default: 1.15, 1.0=none; 1.0 with --image)\n");
     printf("  --gpu                    Attempt GPU compute acceleration (graceful CPU fallback)\n");
     printf("  --kv-int8                Enable INT8 quantized KV cache (75%% memory reduction)\n\n");
     printf("Examples:\n");
@@ -80,6 +82,7 @@ int main(int argc, char **argv)
     float temperature = 0.7f;
     float top_p = 0.9f;
     float rep_penalty = 1.15f;
+    bool temp_set = false, rep_set = false; /* explicit -T / -r win over the image-mode defaults */
     bool use_gpu = false;
     int kv_type = 0;
 
@@ -88,6 +91,8 @@ int main(int argc, char **argv)
             if (i + 1 < argc) prompt = argv[++i];
         } else if (strcmp(argv[i], "-e") == 0 || strcmp(argv[i], "--embed") == 0) {
             if (i + 1 < argc) embed_text = argv[++i];
+        } else if (strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0) {
+            if (i + 1 < argc) model_path = argv[++i];
         } else if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--image") == 0) {
             if (i + 1 < argc) image_path = argv[++i];
         } else if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--max-tokens") == 0 || strcmp(argv[i], "n") == 0) {
@@ -95,11 +100,11 @@ int main(int argc, char **argv)
         } else if (strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--tokenizer") == 0) {
             if (i + 1 < argc) tokenizer_path = argv[++i];
         } else if (strcmp(argv[i], "-T") == 0 || strcmp(argv[i], "--temp") == 0 || strcmp(argv[i], "--temperature") == 0) {
-            if (i + 1 < argc) temperature = (float)atof(argv[++i]);
+            if (i + 1 < argc) { temperature = (float)atof(argv[++i]); temp_set = true; }
         } else if (strcmp(argv[i], "--top-p") == 0) {
             if (i + 1 < argc) top_p = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "-r") == 0 || strcmp(argv[i], "--rep-penalty") == 0 || strcmp(argv[i], "--repetition-penalty") == 0) {
-            if (i + 1 < argc) rep_penalty = (float)atof(argv[++i]);
+            if (i + 1 < argc) { rep_penalty = (float)atof(argv[++i]); rep_set = true; }
         } else if (strcmp(argv[i], "--gpu") == 0) {
             use_gpu = true;
         } else if (strcmp(argv[i], "--kv-int8") == 0) {
@@ -120,6 +125,13 @@ int main(int argc, char **argv)
     if (!model_path) {
         print_usage(argv[0]);
         return 1;
+    }
+
+    /* Document images (DocTags / OTSL) need deterministic decoding: sampling noise and the repetition
+     * penalty (which punishes the many repeated <loc_N> / cell tags) corrupt the structured output. */
+    if (image_path != NULL) {
+        if (!temp_set) temperature = 0.0f;
+        if (!rep_set) rep_penalty = 1.0f;
     }
 
     /* Dedicated Embedding Inference Mode */

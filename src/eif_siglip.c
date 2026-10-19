@@ -1054,129 +1054,214 @@ int eif_siglip_encode_tile(const eif_siglip_t *model, const float *tile_pixels, 
     return 0;
 }
 
-static void resize_bilinear_rgb(const uint8_t *src, int src_w, int src_h,
-                                float *dst_chw, int dst_w, int dst_h)
+/* ---------------------------------------------------------------------------------------------
+ * Idefics3 image preprocessing (matches transformers' Idefics3ImageProcessor, size.longest_edge
+ * = 2048, max_image_size.longest_edge = 512, resample = LANCZOS, do_image_splitting = true):
+ *   1. scale the longest edge to 2048 (small images are enlarged), keeping the aspect ratio;
+ *   2. round both sides up to multiples of 512 (this stretches the image slightly);
+ *   3. cut it into rows x cols tiles of 512 x 512 (row-major) and append a 512 x 512 global view.
+ * The number of tiles is therefore rows * cols + 1 (5 .. 17), not a constant 13.
+ * ------------------------------------------------------------------------------------------- */
+
+static int ceil_div_i(int a, int b) { return (a + b - 1) / b; }
+
+/* _resize_output_size_rescale_to_max_len(min_len = 1, max_len = 2048) */
+static void rescale_to_longest_edge(int w, int h, int max_len, int *out_w, int *out_h)
 {
-    float scale_x = (float)src_w / (float)dst_w;
-    float scale_y = (float)src_h / (float)dst_h;
-
-    for (int y = 0; y < dst_h; y++) {
-        float src_y = (y + 0.5f) * scale_y - 0.5f;
-        int y0 = (int)floorf(src_y);
-        int y1 = y0 + 1;
-        float dy = src_y - (float)y0;
-        if (y0 < 0) { y0 = 0; dy = 0.0f; }
-        if (y1 >= src_h) { y1 = src_h - 1; }
-
-        for (int x = 0; x < dst_w; x++) {
-            float src_x = (x + 0.5f) * scale_x - 0.5f;
-            int x0 = (int)floorf(src_x);
-            int x1 = x0 + 1;
-            float dx = src_x - (float)x0;
-            if (x0 < 0) { x0 = 0; dx = 0.0f; }
-            if (x1 >= src_w) { x1 = src_w - 1; }
-
-            for (int c = 0; c < 3; c++) {
-                float v00 = (float)src[(y0 * src_w + x0) * 3 + c];
-                float v01 = (float)src[(y0 * src_w + x1) * 3 + c];
-                float v10 = (float)src[(y1 * src_w + x0) * 3 + c];
-                float v11 = (float)src[(y1 * src_w + x1) * 3 + c];
-                float val = (1.0f - dy) * ((1.0f - dx) * v00 + dx * v01) +
-                            dy * ((1.0f - dx) * v10 + dx * v11);
-                /* SigLIP2 normalization: val / 127.5f - 1.0f */
-                dst_chw[c * (dst_h * dst_w) + y * dst_w + x] = (val / 127.5f) - 1.0f;
-            }
-        }
+    double aspect = (double)w / (double)h;
+    int nw = w, nh = h;
+    if (w >= h) {
+        nw = max_len;
+        nh = (int)((double)nw / aspect);
+        if (nh % 2 != 0) nh++;
+    } else {
+        nh = max_len;
+        nw = (int)((double)nh * aspect);
+        if (nw % 2 != 0) nw++;
     }
+    *out_w = nw < 1 ? 1 : nw;
+    *out_h = nh < 1 ? 1 : nh;
 }
 
-int eif_siglip_encode_image(const eif_siglip_t *model, const char *image_path, float *out_tokens)
+/* resize_for_vision_encoder: sides rounded up to multiples of `m` */
+static void round_up_to_multiple(int w, int h, int m, int *out_w, int *out_h)
 {
-    if (!model || !model->is_initialized || !image_path || !out_tokens) return -1;
-
-    int img_w = 0, img_h = 0, channels = 0;
-    uint8_t *img_data = stbi_load(image_path, &img_w, &img_h, &channels, 3);
-    if (!img_data) {
-        fprintf(stderr, "[EIF SigLIP Error] Failed to load image: %s\n", image_path);
-        return -2;
+    double aspect = (double)w / (double)h;
+    int nw = w, nh = h;
+    if (w >= h) {
+        nw = ceil_div_i(w, m) * m;
+        nh = (int)((double)nw / aspect);
+        nh = ceil_div_i(nh, m) * m;
+    } else {
+        nh = ceil_div_i(h, m) * m;
+        nw = (int)((double)nh * aspect);
+        nw = ceil_div_i(nw, m) * m;
     }
+    *out_w = nw;
+    *out_h = nh;
+}
 
-    fprintf(stderr, "  • Vision Pipeline: Processing '%s' (%dx%d RGB)\n", image_path, img_w, img_h);
-    fflush(stderr);
+int eif_siglip_plan_tiles(int img_w, int img_h, int *rows, int *cols)
+{
+    if (img_w <= 0 || img_h <= 0) return -1;
+    int w1, h1, w2, h2;
+    rescale_to_longest_edge(img_w, img_h, 2048, &w1, &h1);
+    round_up_to_multiple(w1, h1, SIGLIP_IMG_SIZE, &w2, &h2);
+    if (rows) *rows = h2 / SIGLIP_IMG_SIZE;
+    if (cols) *cols = w2 / SIGLIP_IMG_SIZE;
+    return 0;
+}
 
-    /* 1. Resize entire image to fit in 4x3 grid (2048 x 1536) */
-    const int grid_rows = 4;
-    const int grid_cols = 3;
-    const int target_h = grid_rows * SIGLIP_IMG_SIZE; /* 2048 */
-    const int target_w = grid_cols * SIGLIP_IMG_SIZE; /* 1536 */
+/* Pillow-compatible Lanczos (a = 3) resampling of an interleaved uint8 RGB image: separable,
+ * anti-aliased when shrinking, horizontal pass first, 8-bit rounding between the passes. */
+static double lanczos3(double x)
+{
+    if (x <= -3.0 || x >= 3.0) return 0.0;
+    if (x > -1e-9 && x < 1e-9) return 1.0;
+    double px = 3.14159265358979323846 * x;
+    return (sin(px) / px) * (sin(px / 3.0) / (px / 3.0));
+}
 
-    float *full_canvas = (float *)malloc(3 * target_h * target_w * sizeof(float));
-    const size_t tile_size_floats = 3 * SIGLIP_IMG_SIZE * SIGLIP_IMG_SIZE;
-    float *tiles_all = (float *)malloc(13 * tile_size_floats * sizeof(float));
-    if (!full_canvas || !tiles_all) {
-        stbi_image_free(img_data);
-        if (full_canvas) free(full_canvas);
-        if (tiles_all) free(tiles_all);
-        return -3;
-    }
+static uint8_t clip_u8(double v)
+{
+    int r = (int)floor(v + 0.5);
+    return (uint8_t)(r < 0 ? 0 : (r > 255 ? 255 : r));
+}
 
-    /* Fill canvas with normalized white (+1.0) */
-    for (int i = 0; i < 3 * target_h * target_w; i++) full_canvas[i] = 1.0f;
+static void resample_axis(const uint8_t *src, int src_w, int src_h, uint8_t *dst, int dst_len, int horizontal)
+{
+    int in_len = horizontal ? src_w : src_h;
+    double scale = (double)in_len / (double)dst_len;
+    double filterscale = scale < 1.0 ? 1.0 : scale;
+    double support = 3.0 * filterscale;
+    int kmax = (int)ceil(support) * 2 + 1;
+    double *w = (double *)malloc((size_t)kmax * sizeof(double));
+    if (!w) return;
 
-    /* Compute scaling preserving aspect ratio to fit inside target_w x target_h */
-    float scale = fminf((float)target_w / (float)img_w, (float)target_h / (float)img_h);
-    int scaled_w = (int)((float)img_w * scale);
-    int scaled_h = (int)((float)img_h * scale);
-    if (scaled_w > target_w) scaled_w = target_w;
-    if (scaled_h > target_h) scaled_h = target_h;
-
-    float *scaled_img = (float *)malloc(3 * scaled_h * scaled_w * sizeof(float));
-    if (!scaled_img) {
-        stbi_image_free(img_data);
-        free(full_canvas);
-        free(tiles_all);
-        return -3;
-    }
-
-    resize_bilinear_rgb(img_data, img_w, img_h, scaled_img, scaled_w, scaled_h);
-
-    /* Place scaled image into full canvas (top-left aligned) */
-    for (int c = 0; c < 3; c++) {
-        for (int y = 0; y < scaled_h; y++) {
-            memcpy(full_canvas + (size_t)c * (target_h * target_w) + (size_t)y * target_w,
-                   scaled_img + (size_t)c * (scaled_h * scaled_w) + (size_t)y * scaled_w,
-                   scaled_w * sizeof(float));
+    for (int o = 0; o < dst_len; o++) {
+        double center = ((double)o + 0.5) * scale;
+        int xmin = (int)(center - support + 0.5);
+        int xmax = (int)(center + support + 0.5);
+        if (xmin < 0) xmin = 0;
+        if (xmax > in_len) xmax = in_len;
+        int n = xmax - xmin;
+        double sum = 0.0;
+        for (int k = 0; k < n; k++) {
+            w[k] = lanczos3(((double)(xmin + k) - center + 0.5) / filterscale);
+            sum += w[k];
         }
-    }
-    free(scaled_img);
+        if (sum != 0.0) for (int k = 0; k < n; k++) w[k] /= sum;
 
-    /* 2. Crop 12 local tiles into tiles_all */
-    for (int r = 0; r < grid_rows; r++) {
-        for (int c = 0; c < grid_cols; c++) {
-            int tidx = r * grid_cols + c;
-            float *dst_tile = tiles_all + (size_t)tidx * tile_size_floats;
-            for (int ch = 0; ch < 3; ch++) {
-                const float *src_plane = full_canvas + (size_t)ch * (target_h * target_w);
-                float *dst_plane = dst_tile + (size_t)ch * (SIGLIP_IMG_SIZE * SIGLIP_IMG_SIZE);
-                for (int ty = 0; ty < SIGLIP_IMG_SIZE; ty++) {
-                    const float *src_row = src_plane + (size_t)(r * SIGLIP_IMG_SIZE + ty) * target_w + (c * SIGLIP_IMG_SIZE);
-                    memcpy(dst_plane + (size_t)ty * SIGLIP_IMG_SIZE, src_row, SIGLIP_IMG_SIZE * sizeof(float));
+        if (horizontal) {
+            for (int y = 0; y < src_h; y++) {
+                for (int c = 0; c < 3; c++) {
+                    double acc = 0.0;
+                    for (int k = 0; k < n; k++) acc += w[k] * src[((size_t)y * src_w + xmin + k) * 3 + c];
+                    dst[((size_t)y * dst_len + o) * 3 + c] = clip_u8(acc);
+                }
+            }
+        } else {
+            for (int x = 0; x < src_w; x++) {
+                for (int c = 0; c < 3; c++) {
+                    double acc = 0.0;
+                    for (int k = 0; k < n; k++) acc += w[k] * src[((size_t)(xmin + k) * src_w + x) * 3 + c];
+                    dst[((size_t)o * src_w + x) * 3 + c] = clip_u8(acc);
                 }
             }
         }
     }
-    free(full_canvas);
+    free(w);
+}
 
-    /* 3. Prepare 13th tile: Global thumbnail into tiles_all[12] */
-    float *thumb_tile = tiles_all + (size_t)12 * tile_size_floats;
-    resize_bilinear_rgb(img_data, img_w, img_h, thumb_tile, SIGLIP_IMG_SIZE, SIGLIP_IMG_SIZE);
-    stbi_image_free(img_data);
+/* Returns a new malloc'd dst_w x dst_h RGB image (or NULL). */
+static uint8_t *resize_lanczos_rgb(const uint8_t *src, int src_w, int src_h, int dst_w, int dst_h)
+{
+    uint8_t *cur = (uint8_t *)malloc((size_t)src_w * src_h * 3);
+    if (!cur) return NULL;
+    memcpy(cur, src, (size_t)src_w * src_h * 3);
+    int cw = src_w, ch = src_h;
+    if (dst_w != cw) {
+        uint8_t *tmp = (uint8_t *)malloc((size_t)dst_w * ch * 3);
+        if (!tmp) { free(cur); return NULL; }
+        resample_axis(cur, cw, ch, tmp, dst_w, 1);
+        free(cur); cur = tmp; cw = dst_w;
+    }
+    if (dst_h != ch) {
+        uint8_t *tmp = (uint8_t *)malloc((size_t)cw * dst_h * 3);
+        if (!tmp) { free(cur); return NULL; }
+        resample_axis(cur, cw, ch, tmp, dst_h, 0);
+        free(cur); cur = tmp; ch = dst_h;
+    }
+    return cur;
+}
 
-    /* 4. Encode all 13 tiles across CPU cores */
-    fprintf(stderr, "  • Vision ViT: Processing 13 tiles across CPU cores...\n");
+/* uint8 HWC crop -> normalised float CHW tile ((v / 255 - 0.5) / 0.5) */
+static void to_chw_tile(const uint8_t *img, int img_w, int x0, int y0, int tw, int th, float *dst)
+{
+    for (int c = 0; c < 3; c++)
+        for (int y = 0; y < th; y++)
+            for (int x = 0; x < tw; x++)
+                dst[(size_t)c * th * tw + (size_t)y * tw + x] =
+                    (float)img[((size_t)(y0 + y) * img_w + x0 + x) * 3 + c] / 127.5f - 1.0f;
+}
+
+int eif_siglip_preprocess_image(const char *image_path, float **out_tiles, int *rows, int *cols)
+{
+    if (!image_path || !out_tiles || !rows || !cols) return -1;
+    int img_w = 0, img_h = 0, channels = 0;
+    uint8_t *img = stbi_load(image_path, &img_w, &img_h, &channels, 3);
+    if (!img) {
+        fprintf(stderr, "[EIF SigLIP Error] Failed to load image: %s\n", image_path);
+        return -2;
+    }
+    fprintf(stderr, "  • Vision Pipeline: Processing '%s' (%dx%d RGB)\n", image_path, img_w, img_h);
+
+    int w1, h1, w2, h2;
+    rescale_to_longest_edge(img_w, img_h, 2048, &w1, &h1);
+    round_up_to_multiple(w1, h1, SIGLIP_IMG_SIZE, &w2, &h2);
+    int nr = h2 / SIGLIP_IMG_SIZE, nc = w2 / SIGLIP_IMG_SIZE;
+
+    uint8_t *step1 = resize_lanczos_rgb(img, img_w, img_h, w1, h1);
+    stbi_image_free(img);
+    uint8_t *step2 = step1 ? resize_lanczos_rgb(step1, w1, h1, w2, h2) : NULL;
+    uint8_t *glob = step2 ? resize_lanczos_rgb(step2, w2, h2, SIGLIP_IMG_SIZE, SIGLIP_IMG_SIZE) : NULL;
+    free(step1);
+
+    const size_t tile_floats = 3 * (size_t)SIGLIP_IMG_SIZE * SIGLIP_IMG_SIZE;
+    float *tiles = glob ? (float *)malloc((size_t)(nr * nc + 1) * tile_floats * sizeof(float)) : NULL;
+    if (!tiles) { free(step2); free(glob); return -3; }
+
+    for (int r = 0; r < nr; r++)
+        for (int c = 0; c < nc; c++)
+            to_chw_tile(step2, w2, c * SIGLIP_IMG_SIZE, r * SIGLIP_IMG_SIZE, SIGLIP_IMG_SIZE, SIGLIP_IMG_SIZE,
+                        tiles + (size_t)(r * nc + c) * tile_floats);
+    to_chw_tile(glob, SIGLIP_IMG_SIZE, 0, 0, SIGLIP_IMG_SIZE, SIGLIP_IMG_SIZE, tiles + (size_t)(nr * nc) * tile_floats);
+    free(step2);
+    free(glob);
+
+    *out_tiles = tiles;
+    *rows = nr;
+    *cols = nc;
+    return 0;
+}
+
+int eif_siglip_encode_image(const eif_siglip_t *model, const char *image_path, float *out_tokens,
+                            int *out_rows, int *out_cols)
+{
+    if (!model || !model->is_initialized || !image_path || !out_tokens) return -1;
+
+    float *tiles_all = NULL;
+    int rows = 0, cols = 0;
+    int rc = eif_siglip_preprocess_image(image_path, &tiles_all, &rows, &cols);
+    if (rc != 0) return rc;
+
+    const int n_tiles = rows * cols + 1;
+    const size_t tile_size_floats = 3 * (size_t)SIGLIP_IMG_SIZE * SIGLIP_IMG_SIZE;
+    fprintf(stderr, "  • Vision ViT: Processing %d tiles (%d x %d grid + global) across CPU cores...\n",
+            n_tiles, rows, cols);
     fflush(stderr);
 
-    for (int t = 0; t < 13; t++) {
+    for (int t = 0; t < n_tiles; t++) {
         const float *tile_pix = tiles_all + (size_t)t * tile_size_floats;
         float *tile_out = out_tokens + (size_t)t * SIGLIP_NUM_TOKENS * SIGLIP_CONN_OUT;
 
@@ -1200,7 +1285,10 @@ int eif_siglip_encode_image(const eif_siglip_t *model, const char *image_path, f
 
     free(tiles_all);
 
-    fprintf(stderr, "  • Vision Pipeline: Encoded 13 tiles -> 832 visual tokens (dim=576) in parallel\n");
+    fprintf(stderr, "  • Vision Pipeline: Encoded %d tiles -> %d visual tokens (dim=%d)\n",
+            n_tiles, n_tiles * SIGLIP_NUM_TOKENS, SIGLIP_CONN_OUT);
     fflush(stderr);
+    if (out_rows) *out_rows = rows;
+    if (out_cols) *out_cols = cols;
     return 0;
 }
