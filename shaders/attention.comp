@@ -1,0 +1,137 @@
+#version 450
+/*
+ * Fused multi-head attention (online softmax, FP32), one workgroup = 64 queries of one head of one tile.
+ * A holds rows of [q | k | v] (row stride ld_in, head h at column h*64 of each part), C receives
+ * softmax(q k^T * scale) v at column h*64 of rows with stride ld_out. Grid: (ceil(S/64), heads, tiles).
+ * Row statistics are reduced with subgroup shuffles inside aligned groups of 8 lanes (subgroup size must be
+ * a multiple of 8); three barriers per block of 32 keys, vec4 shared-memory operands.
+ */
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer BufA { float a[]; };
+layout(std430, set = 0, binding = 4) buffer BufC { float c[]; };
+
+layout(push_constant) uniform PC {
+    uint S;          /* tokens per tile */
+    uint heads;
+    uint ld_in, ld_out;
+    uint a_off, c_off;
+    float scale_log2; /* softmax scale * log2(e) */
+} p;
+
+#define D 64
+#define BQ 64
+#define BKV 32
+
+shared vec4 Qs[BQ][D / 4 + 1];
+shared vec4 Ks[BKV][D / 4 + 1];
+shared vec4 Vs[BKV][D / 4];
+shared vec4 Ps[BQ][BKV / 4 + 1];
+shared float corr_s[BQ], l_s[BQ];
+
+float group8_max(float v)
+{
+    v = max(v, subgroupShuffleXor(v, 1u));
+    v = max(v, subgroupShuffleXor(v, 2u));
+    return max(v, subgroupShuffleXor(v, 4u));
+}
+
+float group8_sum(float v)
+{
+    v += subgroupShuffleXor(v, 1u);
+    v += subgroupShuffleXor(v, 2u);
+    return v + subgroupShuffleXor(v, 4u);
+}
+
+vec4 load4(uint idx) { return vec4(a[idx], a[idx + 1u], a[idx + 2u], a[idx + 3u]); }
+
+void main()
+{
+    /* linear id in subgroup order, so groups of 8 consecutive ids are aligned lanes of one subgroup */
+    const uint t = gl_SubgroupID * gl_SubgroupSize + gl_SubgroupInvocationID;
+    const uint q0 = gl_WorkGroupID.x * BQ;
+    const uint row0 = gl_WorkGroupID.z * p.S;
+    const uint dk = p.heads * D;
+    const uint col = gl_WorkGroupID.y * D;
+
+    for (uint e = t; e < BQ * D / 4u; e += 256u) {
+        uint r = e / (D / 4u), d4 = e % (D / 4u), q = q0 + r;
+        Qs[r][d4] = q < p.S ? load4(p.a_off + (row0 + q) * p.ld_in + col + 4u * d4) : vec4(0.0);
+    }
+
+    /* S phase: queries sq, sq + 32 x keys sk + 8 j ; PV phase: queries oq + 16 i x dims 4 od .. 4 od + 3 */
+    const uint sq = t / 8u, sk = t % 8u;
+    const uint oq = t / 16u, od = t % 16u;
+    float m[2] = float[2](-1e30, -1e30), l[2] = float[2](0.0, 0.0);
+    vec4 o[4];
+    [[unroll]] for (int i = 0; i < 4; i++) o[i] = vec4(0.0);
+
+    for (uint k0 = 0; k0 < p.S; k0 += BKV) {
+        barrier();
+        for (uint e = t; e < BKV * D / 4u; e += 256u) {
+            uint r = e / (D / 4u), d4 = e % (D / 4u), k = k0 + r;
+            bool ok = k < p.S;
+            uint base = p.a_off + (row0 + k) * p.ld_in + col + 4u * d4;
+            Ks[r][d4] = ok ? load4(base + dk) : vec4(0.0);
+            Vs[r][d4] = ok ? load4(base + 2u * dk) : vec4(0.0);
+        }
+        barrier();
+
+        float s[2][4];
+        [[unroll]] for (int i = 0; i < 2; i++) [[unroll]] for (int j = 0; j < 4; j++) s[i][j] = 0.0;
+        for (uint d4 = 0; d4 < D / 4u; d4++) {
+            vec4 qa = Qs[sq][d4], qb = Qs[sq + 32u][d4];
+            [[unroll]] for (uint j = 0; j < 4u; j++) {
+                vec4 kv = Ks[sk + 8u * j][d4];
+                s[0][j] += dot(qa, kv);
+                s[1][j] += dot(qb, kv);
+            }
+        }
+        [[unroll]] for (uint i = 0; i < 2u; i++) {
+            float mx = -1e30;
+            [[unroll]] for (uint j = 0; j < 4u; j++) {
+                s[i][j] = (k0 + sk + 8u * j < p.S) ? s[i][j] * p.scale_log2 : -1e30;
+                mx = max(mx, s[i][j]);
+            }
+            float m_new = max(m[i], group8_max(mx));
+            float corr = exp2(m[i] - m_new);
+            float sum = 0.0;
+            [[unroll]] for (uint j = 0; j < 4u; j++) {
+                float e = exp2(s[i][j] - m_new);
+                uint k = sk + 8u * j;
+                Ps[sq + 32u * i][k / 4u][k % 4u] = e;
+                sum += e;
+            }
+            l[i] = l[i] * corr + group8_sum(sum);
+            m[i] = m_new;
+            if (sk == 0u) corr_s[sq + 32u * i] = corr;
+        }
+        barrier();
+
+        [[unroll]] for (uint i = 0; i < 4u; i++) o[i] *= corr_s[oq + 16u * i];
+        for (uint k4 = 0; k4 < BKV / 4u; k4++) {
+            vec4 v0 = Vs[4u * k4][od], v1 = Vs[4u * k4 + 1u][od], v2 = Vs[4u * k4 + 2u][od], v3 = Vs[4u * k4 + 3u][od];
+            [[unroll]] for (uint i = 0; i < 4u; i++) {
+                vec4 pv = Ps[oq + 16u * i][k4];
+                o[i] = fma(vec4(pv.x), v0, o[i]);
+                o[i] = fma(vec4(pv.y), v1, o[i]);
+                o[i] = fma(vec4(pv.z), v2, o[i]);
+                o[i] = fma(vec4(pv.w), v3, o[i]);
+            }
+        }
+    }
+
+    if (sk == 0u) { l_s[sq] = l[0]; l_s[sq + 32u] = l[1]; }
+    barrier();
+    [[unroll]] for (uint i = 0; i < 4u; i++) {
+        uint q = q0 + oq + 16u * i;
+        if (q >= p.S) continue;
+        vec4 r = o[i] / l_s[oq + 16u * i];
+        uint ci = p.c_off + (row0 + q) * p.ld_out + col + 4u * od;
+        c[ci] = r.x; c[ci + 1u] = r.y; c[ci + 2u] = r.z; c[ci + 3u] = r.w;
+    }
+}

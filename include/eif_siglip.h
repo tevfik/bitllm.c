@@ -113,7 +113,8 @@ typedef struct {
 
     bool is_initialized;
     uint8_t *allocated_weights; /* Non-NULL if loaded from file and owns memory */
-    eif_gpu_context_t gpu;      /* Optional Vulkan GPU backend */
+    eif_gpu_context_t gpu;      /* Vulkan context owned by the model (eif_siglip_use_gpu with ctx = NULL) */
+    void *gpu_vit;              /* GPU-resident weights and activations, NULL when encoding on the CPU */
 } eif_siglip_t;
 
 /**
@@ -146,6 +147,27 @@ size_t eif_siglip_struct_size(void);
  * @return 0 on success, negative on bad arguments.
  */
 int eif_siglip_dequant_weight(const eif_siglip_t *model, int l, int m, float *out);
+
+/**
+ * @brief Run the encoder on a Vulkan GPU: uploads the ViT + connector weights once (INT8 weights stay INT8)
+ *        and encodes batches of tiles with one submit each.
+ *
+ * @param ctx Initialised GPU context to share (must outlive the model), or NULL to create one owned by the model.
+ * @return 0 if the GPU path is active; negative if unavailable (the model keeps encoding on the CPU).
+ *         BITLLM_GPU_TILE_BATCH sets the tiles per submit (default 8; reduced to fit device memory limits).
+ *         A GPU context is not thread-safe: do not encode concurrently with models sharing one context.
+ */
+int eif_siglip_use_gpu(eif_siglip_t *model, eif_gpu_context_t *ctx);
+
+/** @brief true if eif_siglip_use_gpu succeeded for this model. */
+bool eif_siglip_gpu_active(const eif_siglip_t *model);
+
+/**
+ * @brief Encode n_tiles tiles ([3, 512, 512] each, contiguous) into out_tokens ([n_tiles * 64, 576]).
+ *        Uses the GPU in batches when active, the CPU otherwise.
+ * @return 0 on success, negative error code on failure.
+ */
+int eif_siglip_encode_tiles(const eif_siglip_t *model, const float *tiles, int n_tiles, float *out_tokens);
 
 /**
  * @brief Free any dynamically allocated weights in SigLIP model.

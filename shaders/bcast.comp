@@ -1,0 +1,17 @@
+#version 450
+/* C[c_off + i] = A[a_off + i % period] for i < count (broadcast a block, e.g. position embeddings per tile). */
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer BufA { float a[]; };
+layout(std430, set = 0, binding = 4) buffer BufC { float c[]; };
+
+layout(push_constant) uniform PC {
+    uint count, period, a_off, c_off;
+} p;
+
+void main()
+{
+    uint stride = gl_NumWorkGroups.x * 256u;
+    for (uint i = gl_GlobalInvocationID.x; i < p.count; i += stride)
+        c[p.c_off + i] = a[p.a_off + i % p.period];
+}

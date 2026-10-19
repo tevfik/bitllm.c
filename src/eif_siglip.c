@@ -6,6 +6,7 @@
 #include "eif_siglip.h"
 #include "eif_gemm.h"
 #include "eif_quantize_bitnet.h"
+#include "eif_siglip_gpu.h"
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 
@@ -145,11 +146,6 @@ int eif_siglip_init_from_buffer(eif_siglip_t *model, const void *buffer, size_t 
     }
 
     model->is_initialized = true;
-    eif_gpu_init(&model->gpu);
-    if (model->gpu.is_available) {
-        fprintf(stderr, "  • Vision Compute: Vulkan GPU Acceleration ACTIVE [%s]\n", model->gpu.device_name);
-        fflush(stderr);
-    }
     return 0;
 }
 
@@ -193,7 +189,8 @@ int eif_siglip_load_from_file(eif_siglip_t *model, const char *filepath, size_t 
 void eif_siglip_free(eif_siglip_t *model)
 {
     if (!model) return;
-    if (model->gpu.is_available) {
+    eif_siglip_gpu_release(model);
+    if (model->gpu.internal_handle) {
         eif_gpu_cleanup(&model->gpu);
     }
     if (model->allocated_weights) {
@@ -204,6 +201,30 @@ void eif_siglip_free(eif_siglip_t *model)
 }
 
 size_t eif_siglip_struct_size(void) { return sizeof(eif_siglip_t); }
+
+int eif_siglip_use_gpu(eif_siglip_t *model, eif_gpu_context_t *ctx)
+{
+    if (!model || !model->is_initialized) return -1;
+    if (!ctx) {
+        if (!model->gpu.internal_handle && !eif_gpu_init(&model->gpu)) return -2;
+        ctx = &model->gpu;
+    }
+    if (!ctx->is_available) return -2;
+    int batch = 8;
+    const char *env = getenv("BITLLM_GPU_TILE_BATCH");
+    if (env && atoi(env) > 0) batch = atoi(env);
+    int rc = eif_siglip_gpu_attach(model, ctx, batch);
+    if (rc != 0) {
+        fprintf(stderr, "  • Vision Compute: GPU unavailable for the ViT (code %d), using the CPU\n", rc);
+        return -3;
+    }
+    fprintf(stderr, "  • Vision Compute: Vulkan GPU [%s], %d tiles per submit\n", ctx->device_name,
+            eif_siglip_gpu_batch(model));
+    fflush(stderr);
+    return 0;
+}
+
+bool eif_siglip_gpu_active(const eif_siglip_t *model) { return model && model->gpu_vit; }
 
 int eif_siglip_dequant_weight(const eif_siglip_t *model, int l, int m, float *out)
 {
@@ -360,7 +381,6 @@ static inline float dot_f32_simd(const float *a, const float *b, int n)
 #endif
 
 static void siglip_gemm_f32(
-    eif_gpu_context_t *gpu,
     const float *A,        /* [M, K] */
     const float *W,        /* [N, K] - row-major */
     const float *bias,     /* [N] (optional) */
@@ -369,17 +389,11 @@ static void siglip_gemm_f32(
     bool residual_add
 )
 {
-    if (gpu && gpu->is_available) {
-        if (eif_gpu_gemm_f32(gpu, A, W, bias, C, M, N, K, 0, residual_add)) {
-            return;
-        }
-    }
 
     eif_gemm_f32_nt(A, W, bias, C, M, N, K, EIF_GEMM_ACT_NONE, residual_add);
 }
 
 static void siglip_gemm_f32_gelu(
-    eif_gpu_context_t *gpu,
     const float *A,        /* [M, K] */
     const float *W,        /* [N, K] */
     const float *bias,     /* [N] */
@@ -387,17 +401,11 @@ static void siglip_gemm_f32_gelu(
     int M, int N, int K
 )
 {
-    if (gpu && gpu->is_available) {
-        if (eif_gpu_gemm_f32(gpu, A, W, bias, C, M, N, K, 1 /* GELU */, false)) {
-            return;
-        }
-    }
 
     eif_gemm_f32_nt(A, W, bias, C, M, N, K, EIF_GEMM_ACT_GELU_TANH, 0);
 }
 
 static void siglip_gemm_qkv(
-    eif_gpu_context_t *gpu,
     const float *A,         /* [M, K] */
     const float *W_q, const float *B_q,
     const float *W_k, const float *B_k,
@@ -406,12 +414,6 @@ static void siglip_gemm_qkv(
     int M, int N, int K
 )
 {
-    if (gpu && gpu->is_available) {
-        bool ok_q = eif_gpu_gemm_f32(gpu, A, W_q, B_q, Q, M, N, K, 0, false);
-        bool ok_k = eif_gpu_gemm_f32(gpu, A, W_k, B_k, K_out, M, N, K, 0, false);
-        bool ok_v = eif_gpu_gemm_f32(gpu, A, W_v, B_v, V_out, M, N, K, 0, false);
-        if (ok_q && ok_k && ok_v) return;
-    }
 
     eif_gemm_f32_nt(A, W_q, B_q, Q, M, N, K, EIF_GEMM_ACT_NONE, 0);
     eif_gemm_f32_nt(A, W_k, B_k, K_out, M, N, K, EIF_GEMM_ACT_NONE, 0);
@@ -610,10 +612,8 @@ int eif_siglip_int8_gemm(const float *A, int M, int K, int G, const int8_t *W8, 
 }
 #endif
 
-int eif_siglip_encode_tile(const eif_siglip_t *model, const float *tile_pixels, float *out_tokens)
+static int siglip_encode_tile_cpu(const eif_siglip_t *model, const float *tile_pixels, float *out_tokens)
 {
-    if (!model || !model->is_initialized || !tile_pixels || !out_tokens) return -1;
-    eif_gpu_context_t *gpu = (eif_gpu_context_t *)&model->gpu;
 
     /* Temporary scratch buffers */
     float *x = (float *)malloc(SIGLIP_NUM_PATCHES * SIGLIP_HIDDEN_SIZE * sizeof(float));
@@ -632,9 +632,9 @@ int eif_siglip_encode_tile(const eif_siglip_t *model, const float *tile_pixels, 
                       : NULL;
     const size_t wsq = (size_t)SIGLIP_HIDDEN_SIZE * SIGLIP_HIDDEN_SIZE;
 #ifdef SIGLIP_I8MM_BUILD
-    /* INT8 weights without Hadamard rotation can run as true INT8 GEMMs (unless a GPU takes the GEMMs) */
+    /* INT8 weights without Hadamard rotation can run as true INT8 GEMMs (CPU path only; the GPU has its own) */
     int use_i8 = model->header.qtype == EIF_SIGLIP_Q_INT8 && !model->header.reserved[1] &&
-                       !(gpu && gpu->is_available) && eif_siglip_int8_gemm_available();
+                 eif_siglip_int8_gemm_available();
     int8_t *a8 = use_i8 ? (int8_t *)malloc((size_t)SIGLIP_NUM_PATCHES * SIGLIP_INTERM_SIZE) : NULL;
     float *a_scale = use_i8 ? (float *)malloc((size_t)SIGLIP_NUM_PATCHES * (SIGLIP_INTERM_SIZE / 8) * sizeof(float)) : NULL;
     int8_t *w8 = use_i8 ? (int8_t *)malloc((size_t)SIGLIP_INTERM_SIZE * SIGLIP_HIDDEN_SIZE) : NULL;
@@ -715,7 +715,7 @@ int eif_siglip_encode_tile(const eif_siglip_t *model, const float *tile_pixels, 
             siglip_proj_i8(model, l, 2, a8, a_scale, SIGLIP_HIDDEN_SIZE, layer->v_b, v, SIGLIP_NUM_PATCHES, SIGLIP_HIDDEN_SIZE, SIGLIP_HIDDEN_SIZE, 0, w8);
         } else
 #endif
-        siglip_gemm_qkv(gpu, x_norm,
+        siglip_gemm_qkv(x_norm,
                         siglip_weight(model, l, 0, wbuf), layer->q_b,
                         siglip_weight(model, l, 1, wbuf ? wbuf + wsq : NULL), layer->k_b,
                         siglip_weight(model, l, 2, wbuf ? wbuf + 2 * wsq : NULL), layer->v_b,
@@ -747,7 +747,7 @@ int eif_siglip_encode_tile(const eif_siglip_t *model, const float *tile_pixels, 
             siglip_proj_i8(model, l, 3, a8, a_scale, SIGLIP_HIDDEN_SIZE, layer->out_b, x, SIGLIP_NUM_PATCHES, SIGLIP_HIDDEN_SIZE, SIGLIP_HIDDEN_SIZE, 2, w8);
         } else
 #endif
-        siglip_gemm_f32(gpu, attn_out, siglip_weight(model, l, 3, wbuf), layer->out_b, x,
+        siglip_gemm_f32(attn_out, siglip_weight(model, l, 3, wbuf), layer->out_b, x,
                         SIGLIP_NUM_PATCHES, SIGLIP_HIDDEN_SIZE, SIGLIP_HIDDEN_SIZE, true);
 
         /* LayerNorm 2 */
@@ -766,7 +766,7 @@ int eif_siglip_encode_tile(const eif_siglip_t *model, const float *tile_pixels, 
             siglip_proj_i8(model, l, 4, a8, a_scale, SIGLIP_HIDDEN_SIZE, layer->fc1_b, mlp_h1, SIGLIP_NUM_PATCHES, SIGLIP_INTERM_SIZE, SIGLIP_HIDDEN_SIZE, 1, w8);
         } else
 #endif
-        siglip_gemm_f32_gelu(gpu, x_norm, siglip_weight(model, l, 4, wbuf), layer->fc1_b, mlp_h1,
+        siglip_gemm_f32_gelu(x_norm, siglip_weight(model, l, 4, wbuf), layer->fc1_b, mlp_h1,
                              SIGLIP_NUM_PATCHES, SIGLIP_INTERM_SIZE, SIGLIP_HIDDEN_SIZE);
 
         /* MLP FC2 + Residual Add */
@@ -776,7 +776,7 @@ int eif_siglip_encode_tile(const eif_siglip_t *model, const float *tile_pixels, 
             siglip_proj_i8(model, l, 5, a8, a_scale, siglip_fc2_group(), layer->fc2_b, x, SIGLIP_NUM_PATCHES, SIGLIP_HIDDEN_SIZE, SIGLIP_INTERM_SIZE, 2, w8);
         } else
 #endif
-        siglip_gemm_f32(gpu, mlp_h1, siglip_weight(model, l, 5, wbuf), layer->fc2_b, x,
+        siglip_gemm_f32(mlp_h1, siglip_weight(model, l, 5, wbuf), layer->fc2_b, x,
                         SIGLIP_NUM_PATCHES, SIGLIP_HIDDEN_SIZE, SIGLIP_INTERM_SIZE, true);
     }
 
@@ -809,7 +809,7 @@ int eif_siglip_encode_tile(const eif_siglip_t *model, const float *tile_pixels, 
     }
 
     /* 5. Connector Modality Projection: [64, 12288] @ W_conn.T [12288, 576] -> [64, 576] */
-    siglip_gemm_f32(gpu, grouped, model->conn_w, NULL, out_tokens,
+    siglip_gemm_f32(grouped, model->conn_w, NULL, out_tokens,
                     SIGLIP_NUM_TOKENS, SIGLIP_CONN_OUT, SIGLIP_CONN_IN, false);
 
     free(x);
@@ -824,6 +824,44 @@ int eif_siglip_encode_tile(const eif_siglip_t *model, const float *tile_pixels, 
     SIGLIP_I8_FREE();
 
     return 0;
+}
+
+/* GPU (in batches) when active, falling back to the CPU if a submit fails. */
+static int siglip_encode_list(const eif_siglip_t *model, const float *const *tiles, int n, float *const *outs)
+{
+    if (model->gpu_vit) {
+        if (eif_siglip_gpu_encode(model, tiles, n, outs) == 0) return 0;
+        fprintf(stderr, "  • Vision Compute: GPU encode failed, falling back to the CPU\n");
+    }
+    for (int t = 0; t < n; t++) {
+        int rc = siglip_encode_tile_cpu(model, tiles[t], outs[t]);
+        if (rc != 0) return rc;
+    }
+    return 0;
+}
+
+int eif_siglip_encode_tile(const eif_siglip_t *model, const float *tile_pixels, float *out_tokens)
+{
+    if (!model || !model->is_initialized || !tile_pixels || !out_tokens) return -1;
+    return siglip_encode_list(model, &tile_pixels, 1, &out_tokens);
+}
+
+int eif_siglip_encode_tiles(const eif_siglip_t *model, const float *tiles, int n_tiles, float *out_tokens)
+{
+    if (!model || !model->is_initialized || !tiles || !out_tokens || n_tiles < 0) return -1;
+    const float **tp = (const float **)malloc((size_t)(n_tiles + 1) * sizeof(*tp));
+    float **op = (float **)malloc((size_t)(n_tiles + 1) * sizeof(*op));
+    int rc = -2;
+    if (tp && op) {
+        for (int t = 0; t < n_tiles; t++) {
+            tp[t] = tiles + (size_t)t * 3 * SIGLIP_IMG_SIZE * SIGLIP_IMG_SIZE;
+            op[t] = out_tokens + (size_t)t * SIGLIP_NUM_TOKENS * SIGLIP_CONN_OUT;
+        }
+        rc = siglip_encode_list(model, tp, n_tiles, op);
+    }
+    free(tp);
+    free(op);
+    return rc;
 }
 
 /* ---------------------------------------------------------------------------------------------
@@ -1029,30 +1067,41 @@ int eif_siglip_encode_image(const eif_siglip_t *model, const char *image_path, f
 
     const int n_tiles = rows * cols + 1;
     const size_t tile_size_floats = 3 * (size_t)SIGLIP_IMG_SIZE * SIGLIP_IMG_SIZE;
-    fprintf(stderr, "  • Vision ViT: Processing %d tiles (%d x %d grid + global) across CPU cores...\n",
-            n_tiles, rows, cols);
+    fprintf(stderr, "  • Vision ViT: Processing %d tiles (%d x %d grid + global) on %s...\n",
+            n_tiles, rows, cols, model->gpu_vit ? "the GPU" : "CPU cores");
     fflush(stderr);
 
-    for (int t = 0; t < n_tiles; t++) {
+    /* Identical tiles (e.g. blank margins) are encoded once and their tokens copied. */
+    const float *uniq_pix[EIF_SIGLIP_MAX_TILES];
+    float *uniq_out[EIF_SIGLIP_MAX_TILES];
+    int src_of[EIF_SIGLIP_MAX_TILES];
+    int n_uniq = 0;
+    for (int t = 0; t < n_tiles && t < EIF_SIGLIP_MAX_TILES; t++) {
         const float *tile_pix = tiles_all + (size_t)t * tile_size_floats;
-        float *tile_out = out_tokens + (size_t)t * SIGLIP_NUM_TOKENS * SIGLIP_CONN_OUT;
-
-        /* Deduplication: If tile is identical to an earlier tile (e.g. blank margin), reuse embeddings */
-        int match_idx = -1;
+        src_of[t] = -1;
         for (int prev = 0; prev < t; prev++) {
-            const float *prev_pix = tiles_all + (size_t)prev * tile_size_floats;
-            if (memcmp(tile_pix, prev_pix, tile_size_floats * sizeof(float)) == 0) {
-                match_idx = prev;
+            if (src_of[prev] < 0 &&
+                memcmp(tile_pix, tiles_all + (size_t)prev * tile_size_floats, tile_size_floats * sizeof(float)) == 0) {
+                src_of[t] = prev;
                 break;
             }
         }
-
-        if (match_idx >= 0) {
-            float *prev_out = out_tokens + (size_t)match_idx * SIGLIP_NUM_TOKENS * SIGLIP_CONN_OUT;
-            memcpy(tile_out, prev_out, (size_t)SIGLIP_NUM_TOKENS * SIGLIP_CONN_OUT * sizeof(float));
-        } else {
-            eif_siglip_encode_tile(model, tile_pix, tile_out);
+        if (src_of[t] < 0) {
+            uniq_pix[n_uniq] = tile_pix;
+            uniq_out[n_uniq] = out_tokens + (size_t)t * SIGLIP_NUM_TOKENS * SIGLIP_CONN_OUT;
+            n_uniq++;
         }
+    }
+    rc = siglip_encode_list(model, uniq_pix, n_uniq, uniq_out);
+    for (int t = 0; t < n_tiles && rc == 0; t++) {
+        if (src_of[t] >= 0)
+            memcpy(out_tokens + (size_t)t * SIGLIP_NUM_TOKENS * SIGLIP_CONN_OUT,
+                   out_tokens + (size_t)src_of[t] * SIGLIP_NUM_TOKENS * SIGLIP_CONN_OUT,
+                   (size_t)SIGLIP_NUM_TOKENS * SIGLIP_CONN_OUT * sizeof(float));
+    }
+    if (rc != 0) {
+        free(tiles_all);
+        return rc;
     }
 
     free(tiles_all);

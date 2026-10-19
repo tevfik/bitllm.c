@@ -29,23 +29,16 @@ if(OpenMP_C_FOUND)
     add_compile_options(${OpenMP_C_FLAGS})
 endif()
 
-# Optional Vulkan GPU Compute support
-option(BITLLM_ENABLE_VULKAN "Enable optional Vulkan GPU acceleration" OFF)
+# Optional Vulkan GPU compute (SigLIP vision encoder). The loader is opened with dlopen at runtime, so no
+# Vulkan SDK or libvulkan is needed to build, and machines without a GPU fall back to the CPU kernels.
+set(_bitllm_vulkan_default OFF)
+if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Windows|Darwin|Android)$")
+    set(_bitllm_vulkan_default ON)
+endif()
+option(BITLLM_ENABLE_VULKAN "Enable optional Vulkan GPU acceleration (runtime-loaded, no link dependency)" ${_bitllm_vulkan_default})
 if(BITLLM_ENABLE_VULKAN)
-    find_package(Vulkan QUIET)
-    if(NOT Vulkan_LIBRARIES)
-        find_library(VULKAN_LIB NAMES vulkan vulkan-1 vulkan.so.1 HINTS /usr/lib/aarch64-linux-gnu /usr/lib/x86_64-linux-gnu /usr/lib64 /usr/lib)
-        if(VULKAN_LIB)
-            set(Vulkan_FOUND TRUE CACHE BOOL "" FORCE)
-            set(Vulkan_LIBRARIES ${VULKAN_LIB} CACHE FILEPATH "" FORCE)
-        endif()
-    endif()
-    if(Vulkan_FOUND OR Vulkan_LIBRARIES)
-        message(STATUS "Vulkan found: Enabling optional BitLLM GPU compute acceleration")
-        add_compile_definitions(EIF_USE_VULKAN=1)
-    else()
-        message(STATUS "Vulkan not found: Gracefully defaulting to CPU-only execution (zero dependency)")
-    endif()
+    message(STATUS "Vulkan GPU backend: enabled (loader opened at runtime, CPU fallback)")
+    add_compile_definitions(EIF_USE_VULKAN=1)
 endif()
 
 include_directories(include)
@@ -61,6 +54,7 @@ set(BITLLM_SOURCES
     src/eif_gpu.c
     src/eif_gemm.c
     src/eif_siglip.c
+    src/eif_siglip_gpu.c
 )
 
 # 1. Static Library (libbitllm.a)
@@ -73,8 +67,8 @@ endif()
 if(OpenMP_C_FOUND)
     target_link_libraries(bitllm_static PRIVATE OpenMP::OpenMP_C)
 endif()
-if(BITLLM_ENABLE_VULKAN AND Vulkan_FOUND)
-    target_link_libraries(bitllm_static PRIVATE ${Vulkan_LIBRARIES})
+if(BITLLM_ENABLE_VULKAN AND CMAKE_DL_LIBS)
+    target_link_libraries(bitllm_static PUBLIC ${CMAKE_DL_LIBS})
 endif()
 
 # Backward compatibility alias & symlinks
@@ -93,8 +87,8 @@ endif()
 if(OpenMP_C_FOUND)
     target_link_libraries(bitllm_shared PRIVATE OpenMP::OpenMP_C)
 endif()
-if(BITLLM_ENABLE_VULKAN AND Vulkan_FOUND)
-    target_link_libraries(bitllm_shared PRIVATE ${Vulkan_LIBRARIES})
+if(BITLLM_ENABLE_VULKAN AND CMAKE_DL_LIBS)
+    target_link_libraries(bitllm_shared PRIVATE ${CMAKE_DL_LIBS})
 endif()
 
 # Backward compatibility alias & symlinks
@@ -260,7 +254,21 @@ if(OpenMP_C_FOUND)
     target_link_libraries(test_siglip_quant PRIVATE OpenMP::OpenMP_C)
 endif()
 
+# 11. Vulkan backend: GEMM kernels and the SigLIP encoder vs CPU (SKIP without a Vulkan device)
+foreach(_t test_gpu_gemm test_siglip_gpu)
+    add_executable(${_t} tests/${_t}.c)
+    target_link_libraries(${_t} PRIVATE bitllm_static)
+    if(UNIX)
+        target_link_libraries(${_t} PRIVATE m)
+    endif()
+    if(OpenMP_C_FOUND)
+        target_link_libraries(${_t} PRIVATE OpenMP::OpenMP_C)
+    endif()
+endforeach()
+
 enable_testing()
+add_test(NAME test_gpu_gemm COMMAND test_gpu_gemm)
+add_test(NAME test_siglip_gpu COMMAND test_siglip_gpu)
 add_test(NAME test_siglip_quant COMMAND test_siglip_quant)
 add_test(NAME test_siglip_tiling COMMAND test_siglip_tiling)
 add_test(NAME test_loop_guard COMMAND test_loop_guard)

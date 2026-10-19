@@ -774,6 +774,7 @@ int eif_llm_encode_vision_docling(const eif_llm_t *llm, const char *image_path, 
                     struct timespec t_v0, t_v1;
                     clock_gettime(CLOCK_MONOTONIC, &t_v0);
                     if (eif_siglip_load_from_file(&siglip, llm->model_path, v_off, v_sz) == 0) {
+                        if (llm->gpu.is_available) eif_siglip_use_gpu(&siglip, (eif_gpu_context_t *)&llm->gpu);
                         clock_gettime(CLOCK_MONOTONIC, &t_v1);
                         double load_sec = (t_v1.tv_sec - t_v0.tv_sec) + (t_v1.tv_nsec - t_v0.tv_nsec) * 1e-9;
                         fprintf(stderr, "  • Vision Model Loaded in %.2fs\n", load_sec);
