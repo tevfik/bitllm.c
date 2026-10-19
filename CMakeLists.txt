@@ -59,6 +59,7 @@ set(BITLLM_SOURCES
     src/eif_quantize_bitnet.c
     src/eif_bert.c
     src/eif_gpu.c
+    src/eif_gemm.c
     src/eif_siglip.c
 )
 
@@ -208,6 +209,16 @@ if(OpenMP_C_FOUND)
     target_link_libraries(test_int8_gemv PRIVATE OpenMP::OpenMP_C)
 endif()
 
+# 9e. Blocked FP32 GEMM (test_gemm)
+add_executable(test_gemm tests/test_gemm.c)
+target_link_libraries(test_gemm PRIVATE bitllm_static)
+if(UNIX)
+    target_link_libraries(test_gemm PRIVATE m)
+endif()
+if(OpenMP_C_FOUND)
+    target_link_libraries(test_gemm PRIVATE OpenMP::OpenMP_C)
+endif()
+
 # 10. Quantised SigLIP2 vision weights (INT8 / INT4 g128 / + Hadamard) (test_siglip_quant)
 add_executable(test_siglip_quant tests/test_siglip_quant.c)
 target_link_libraries(test_siglip_quant PRIVATE bitllm_static)
@@ -223,6 +234,7 @@ add_test(NAME test_siglip_quant COMMAND test_siglip_quant)
 add_test(NAME test_siglip_tiling COMMAND test_siglip_tiling)
 add_test(NAME test_loop_guard COMMAND test_loop_guard)
 add_test(NAME test_int8_gemv COMMAND test_int8_gemv)
+add_test(NAME test_gemm COMMAND test_gemm)
 add_test(NAME test_all_features COMMAND test_all_features)
 add_test(NAME test_live_models COMMAND test_live_models)
 add_test(NAME test_alibi_and_benchmark COMMAND test_alibi_and_benchmark)
