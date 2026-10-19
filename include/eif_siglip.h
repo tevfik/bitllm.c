@@ -162,6 +162,25 @@ void eif_siglip_free(eif_siglip_t *model);
  */
 int eif_siglip_encode_tile(const eif_siglip_t *model, const float *tile_pixels, float *out_tokens);
 
+/**
+ * @brief 1 if the INT8 ViT projections can run (Armv8.6 i8mm present and BITLLM_VIT_FP32 not set to 1).
+ *
+ * INT8-exported ViT weights are then multiplied as INT8 x INT8 -> INT32 (SMMLA) with activations quantised
+ * per row (per group of 64 inputs for the fc2 input, BITLLM_VIT_FC2_GROUP), instead of being dequantised to
+ * FP32. BITLLM_VIT_I8_MASK selects the projections (bits: q, k, v, out, fc1, fc2; default 0x3F).
+ */
+int eif_siglip_int8_gemm_available(void);
+
+/**
+ * @brief C[M,N] (op)= act(sa * sw * A8 . W8^T + bias): the INT8 projection kernel, exposed for tests.
+ *
+ * A [M,K] FP32 is quantised with one scale per row and group of G inputs; W8 [N,K] int8 with per-row
+ * scales sw. mode 0 stores, 1 applies tanh-GELU, 2 adds to C. M, N, K, G multiples of 8, K % G == 0.
+ * @return 0 on success, -1 if INT8 GEMM is unavailable, other negatives on bad arguments.
+ */
+int eif_siglip_int8_gemm(const float *A, int M, int K, int G, const int8_t *W8, const float *sw, int N,
+                         const float *bias, float *C, int mode);
+
 /** Largest tile count the Idefics3 pipeline can produce: 4 x 4 grid + 1 global view. */
 #define EIF_SIGLIP_MAX_TILES 17
 
