@@ -1008,7 +1008,11 @@ int eif_llm_generate_vision_docling_from(eif_llm_t *llm, const eif_llm_vision_in
         }
         generated_count++;
 
-        tinyllm_forward(&llm->backend.tinyllm, next_token, pos++);
+        if (!tinyllm_forward(&llm->backend.tinyllm, next_token, pos++)) {
+            fprintf(stderr, "  • Context full (%d tokens), stopping\n", llm->seq_len);
+            fflush(stderr);
+            break;
+        }
     }
 
     return generated_count;

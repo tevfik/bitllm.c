@@ -384,6 +384,10 @@ float *tinyllm_forward_embedding_ex(tinyllm_t *llm, const float *embedding, int 
                                 (q_dim + kv_dim * 2 + dim) :
                                 (dim * 4 + kv_dim * 2);
 
+    if (pos < 0 || pos >= p->seq_len) {
+        return NULL; /* the KV cache has seq_len slots per layer; writing further corrupts the next layer */
+    }
+
     if (embedding != s->x) {
         memcpy(s->x, embedding, dim * sizeof(float));
     }

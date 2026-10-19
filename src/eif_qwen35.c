@@ -653,6 +653,8 @@ float *qwen35_forward_ex(qwen35_t *m, int tok, int pos, bool compute_logits) {
     size_t dn_scratch_n = conv_dim + val_dim*3 + nv2*2;
     float *dn_scratch = (float *)alloca(dn_scratch_n * sizeof(float));
 
+    if (pos < 0 || pos >= cfg->max_seq_len) return NULL;
+
     /* 1. Embed */
     embed_lookup(s->x, (const uint8_t *)w->embed, w->embed_s, tok, dim, cfg->quant_embed);
 
@@ -731,6 +733,11 @@ void qwen35_inject_visual(qwen35_t *m, const float *embs, int n_tok, int start_p
     size_t dn_scratch_n = conv_dim + val_dim*3 + nv2*2;
     float *dn_scratch = (float *)alloca(dn_scratch_n * sizeof(float));
 
+    if (start_pos < 0 || n_tok < 0 || start_pos + n_tok > cfg->max_seq_len) {
+        fprintf(stderr, "qwen35_inject_visual: %d tokens at %d exceed max_seq_len %d\n", n_tok, start_pos,
+                cfg->max_seq_len);
+        return;
+    }
     for (int t = 0; t < n_tok; t++) {
         memcpy(s->x, embs + (size_t)t * dim, dim * sizeof(float));
         int dn_idx = 0, fa_idx = 0;
