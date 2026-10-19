@@ -1,0 +1,126 @@
+#version 450
+/*
+ * Fused multi-head attention (online softmax, FP32), one workgroup = 64 queries of one head of one tile.
+ * A holds rows of [q | k | v] (row stride ld_in, head h at column h*64 of each part), C receives
+ * softmax(q k^T * scale) v at column h*64 of rows with stride ld_out. Grid: (ceil(S/64), heads, tiles).
+ */
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer BufA { float a[]; };
+layout(std430, set = 0, binding = 4) buffer BufC { float c[]; };
+
+layout(push_constant) uniform PC {
+    uint S;          /* tokens per tile */
+    uint heads;
+    uint ld_in, ld_out;
+    uint a_off, c_off;
+    float scale_log2; /* softmax scale * log2(e) */
+} p;
+
+#define D 64
+#define BQ 64
+#define BKV 32
+
+shared float Qs[BQ][D + 1];
+shared float KVs[BKV][D + 1];
+shared float Ps[BQ][BKV + 1];
+shared float red[BQ][4];
+shared float m_s[BQ], l_s[BQ], corr_s[BQ];
+
+void main()
+{
+    const uint t = gl_LocalInvocationID.x;
+    const uint q0 = gl_WorkGroupID.x * BQ;
+    const uint h = gl_WorkGroupID.y;
+    const uint tile_row0 = gl_WorkGroupID.z * p.S;
+    const uint dk = p.heads * D;          /* column offset of k inside a row */
+    const uint qcol = h * D;
+
+    for (uint e = t; e < BQ * D; e += 256u) {
+        uint r = e / D, d = e % D;
+        uint q = q0 + r;
+        Qs[r][d] = q < p.S ? a[p.a_off + (tile_row0 + q) * p.ld_in + qcol + d] : 0.0;
+    }
+    if (t < BQ) { m_s[t] = -1e30; l_s[t] = 0.0; corr_s[t] = 1.0; }
+
+    /* S phase: queries sq + 32 i, keys sk + 8 j ; PV phase: queries oq + 16 i, dims od + 16 j */
+    const uint sq = t / 8u, sk = t % 8u;
+    const uint oq = t / 16u, od = t % 16u;
+    /* stats phase: row r, quarter part of the 32 keys */
+    const uint rr = t / 4u, part = t % 4u;
+    float o[4][4];
+    for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) o[i][j] = 0.0;
+
+    for (uint k0 = 0; k0 < p.S; k0 += BKV) {
+        barrier();
+        for (uint e = t; e < BKV * D; e += 256u) {
+            uint r = e / D, d = e % D;
+            uint k = k0 + r;
+            KVs[r][d] = k < p.S ? a[p.a_off + (tile_row0 + k) * p.ld_in + dk + qcol + d] : 0.0;
+        }
+        barrier();
+        float s[2][4];
+        for (int i = 0; i < 2; i++) for (int j = 0; j < 4; j++) s[i][j] = 0.0;
+        for (uint d = 0; d < D; d++) {
+            float qa = Qs[sq][d], qb = Qs[sq + 32u][d];
+            for (uint j = 0; j < 4u; j++) {
+                float kv = KVs[sk + 8u * j][d];
+                s[0][j] = fma(qa, kv, s[0][j]);
+                s[1][j] = fma(qb, kv, s[1][j]);
+            }
+        }
+        for (uint i = 0; i < 2u; i++)
+            for (uint j = 0; j < 4u; j++)
+                Ps[sq + 32u * i][sk + 8u * j] = (k0 + sk + 8u * j < p.S) ? s[i][j] * p.scale_log2 : -1e30;
+        barrier();
+
+        /* V block replaces K; row maxima */
+        for (uint e = t; e < BKV * D; e += 256u) {
+            uint r = e / D, d = e % D;
+            uint k = k0 + r;
+            KVs[r][d] = k < p.S ? a[p.a_off + (tile_row0 + k) * p.ld_in + 2u * dk + qcol + d] : 0.0;
+        }
+        float mx = -1e30;
+        for (uint j = 0; j < 8u; j++) mx = max(mx, Ps[rr][part * 8u + j]);
+        red[rr][part] = mx;
+        barrier();
+        float m_old = m_s[rr];
+        float m_new = max(m_old, max(max(red[rr][0], red[rr][1]), max(red[rr][2], red[rr][3])));
+        float sum = 0.0;
+        for (uint j = 0; j < 8u; j++) {
+            float e = exp2(Ps[rr][part * 8u + j] - m_new);
+            Ps[rr][part * 8u + j] = e;
+            sum += e;
+        }
+        barrier();
+        red[rr][part] = sum;
+        barrier();
+        if (part == 0u) {
+            float corr = exp2(m_old - m_new);
+            l_s[rr] = l_s[rr] * corr + red[rr][0] + red[rr][1] + red[rr][2] + red[rr][3];
+            m_s[rr] = m_new;
+            corr_s[rr] = corr;
+        }
+        barrier();
+
+        for (uint i = 0; i < 4u; i++) {
+            float cr = corr_s[oq + 16u * i];
+            for (uint j = 0; j < 4u; j++) o[i][j] *= cr;
+        }
+        for (uint k = 0; k < BKV; k++) {
+            float pv[4], vv[4];
+            for (uint i = 0; i < 4u; i++) pv[i] = Ps[oq + 16u * i][k];
+            for (uint j = 0; j < 4u; j++) vv[j] = KVs[k][od + 16u * j];
+            for (uint i = 0; i < 4u; i++)
+                for (uint j = 0; j < 4u; j++) o[i][j] = fma(pv[i], vv[j], o[i][j]);
+        }
+    }
+
+    for (uint i = 0; i < 4u; i++) {
+        uint q = q0 + oq + 16u * i;
+        if (q >= p.S) continue;
+        float inv = 1.0 / l_s[oq + 16u * i];
+        for (uint j = 0; j < 4u; j++)
+            c[p.c_off + (tile_row0 + q) * p.ld_out + qcol + od + 16u * j] = o[i][j] * inv;
+    }
+}

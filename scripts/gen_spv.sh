@@ -14,12 +14,13 @@ VARIANTS="
 gemm_f32      gemm.comp
 gemm_q8       gemm.comp -DB_INT8
 gemm_kn       gemm.comp -DB_KN
-gemm_f32_big  gemm.comp -DBM=128 -DBN=128 -DBK=8 -DTM=8 -DTN=8
-gemm_q8_big   gemm.comp -DB_INT8 -DBM=128 -DBN=128 -DBK=8 -DTM=8 -DTN=8
+gemm_f32_big  gemm_vec.comp
+gemm_q8_big   gemm_vec.comp -DB_INT8
 layernorm     layernorm.comp
 softmax       softmax.comp
 bcast         bcast.comp
 merge         merge.comp
+attention     attention.comp
 "
 
 {

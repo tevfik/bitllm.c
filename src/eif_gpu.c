@@ -70,6 +70,7 @@ typedef struct {
     VkPhysicalDeviceMemoryProperties mem_props;
     VkDeviceSize max_range;
     uint32_t max_groups[3];
+    uint32_t max_shared;
     VkCommandPool cmd_pool;
     VkCommandBuffer cmd;
     VkFence fence;
@@ -260,6 +261,12 @@ bool eif_gpu_buf_upload(eif_gpu_context_t *ctx, eif_gpu_buf_t *b, size_t offset,
     return true;
 }
 
+bool eif_gpu_kernel_available(const eif_gpu_context_t *ctx, int kernel)
+{
+    if (!ctx || !ctx->is_available || !ctx->internal_handle || kernel < 0 || kernel >= EIF_GPU_K_COUNT) return false;
+    return ((const vk_state_t *)ctx->internal_handle)->pipes[kernel] != VK_NULL_HANDLE;
+}
+
 bool eif_gpu_cmd_begin(eif_gpu_context_t *ctx)
 {
     if (!ctx || !ctx->is_available || !ctx->internal_handle) return false;
@@ -276,7 +283,7 @@ bool eif_gpu_cmd_dispatch(eif_gpu_context_t *ctx, int kernel, eif_gpu_buf_t *con
 {
     vk_state_t *s = (vk_state_t *)ctx->internal_handle;
     if (!s->recording || s->failed) return false;
-    if (kernel < 0 || kernel >= EIF_GPU_K_COUNT || push_bytes > 128 || gx == 0 || gy == 0 || gz == 0 ||
+    if (kernel < 0 || kernel >= EIF_GPU_K_COUNT || !s->pipes[kernel] || push_bytes > 128 || gx == 0 || gy == 0 || gz == 0 ||
         gx > s->max_groups[0] || gy > s->max_groups[1] || gz > s->max_groups[2]) {
         s->failed = true;
         return false;
@@ -319,8 +326,11 @@ bool eif_gpu_cmd_dispatch(eif_gpu_context_t *ctx, int kernel, eif_gpu_buf_t *con
 bool eif_gpu_cmd_gemm(eif_gpu_context_t *ctx, int kernel, eif_gpu_buf_t *A, eif_gpu_buf_t *B, eif_gpu_buf_t *S,
                       eif_gpu_buf_t *bias, eif_gpu_buf_t *C, const eif_gpu_gemm_pc_t *pc, uint32_t gz)
 {
-    /* 128x128 tiles (8x8 outputs per thread) when the grid still fills the GPU, 64x64 otherwise */
-    bool big = (kernel == EIF_GPU_K_GEMM_F32 || kernel == EIF_GPU_K_GEMM_Q8) &&
+    /* 128x128 vec4 tiles (8x8 outputs per thread) when operands are 16-byte aligned and the grid still
+     * fills the GPU, the general 64x64 kernel otherwise */
+    const uint32_t align = pc->K | pc->lda | pc->ldb | pc->a_off | pc->b_off | pc->a_s1 | pc->a_s2 | pc->b_s1 |
+                           pc->b_s2;
+    bool big = (kernel == EIF_GPU_K_GEMM_F32 || kernel == EIF_GPU_K_GEMM_Q8) && (align & 3u) == 0 &&
                (uint64_t)((pc->M + 127) / 128) * ((pc->N + 127) / 128) * gz >= 96;
     if (big) kernel = (kernel == EIF_GPU_K_GEMM_F32) ? EIF_GPU_K_GEMM_F32_BIG : EIF_GPU_K_GEMM_Q8_BIG;
     uint32_t tile = big ? 128 : 64;
@@ -378,7 +388,9 @@ static bool vk_create_pipelines(vk_state_t *s)
         [EIF_GPU_K_SOFTMAX] = {eif_spv_softmax, sizeof(eif_spv_softmax)},
         [EIF_GPU_K_BCAST] = {eif_spv_bcast, sizeof(eif_spv_bcast)},
         [EIF_GPU_K_MERGE] = {eif_spv_merge, sizeof(eif_spv_merge)},
+        [EIF_GPU_K_ATTENTION] = {eif_spv_attention, sizeof(eif_spv_attention)},
     };
+    static const uint32_t shared_bytes[EIF_GPU_K_COUNT] = { [EIF_GPU_K_ATTENTION] = 36 * 1024 };
     VkDescriptorSetLayoutBinding b[EIF_VK_NBIND];
     for (int i = 0; i < EIF_VK_NBIND; i++) {
         b[i].binding = (uint32_t)i;
@@ -403,6 +415,7 @@ static bool vk_create_pipelines(vk_state_t *s)
     };
     if (s->vkCreatePipelineLayout(s->device, &pli, NULL, &s->pl) != VK_SUCCESS) return false;
     for (int k = 0; k < EIF_GPU_K_COUNT; k++) {
+        if (shared_bytes[k] > s->max_shared) continue; /* optional kernel, callers check availability */
         VkShaderModuleCreateInfo smi = {
             .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
             .codeSize = spv[k].size,
@@ -548,6 +561,7 @@ static bool vk_init_state(eif_gpu_context_t *ctx, vk_state_t *s)
     snprintf(ctx->device_name, sizeof(ctx->device_name), "%s", props.deviceName);
     s->max_range = props.limits.maxStorageBufferRange;
     for (int i = 0; i < 3; i++) s->max_groups[i] = props.limits.maxComputeWorkGroupCount[i];
+    s->max_shared = props.limits.maxComputeSharedMemorySize;
     if (props.limits.maxPushConstantsSize < 128 || props.limits.maxComputeWorkGroupInvocations < 256 ||
         props.limits.maxComputeSharedMemorySize < 16384)
         return false;
@@ -790,6 +804,7 @@ bool eif_gpu_buf_upload(eif_gpu_context_t *ctx, eif_gpu_buf_t *b, size_t offset,
     return false;
 }
 size_t eif_gpu_max_binding_bytes(const eif_gpu_context_t *ctx) { (void)ctx; return 0; }
+bool eif_gpu_kernel_available(const eif_gpu_context_t *ctx, int kernel) { (void)ctx; (void)kernel; return false; }
 bool eif_gpu_cmd_begin(eif_gpu_context_t *ctx) { (void)ctx; return false; }
 bool eif_gpu_cmd_dispatch(eif_gpu_context_t *ctx, int kernel, eif_gpu_buf_t *const bufs[5],
                           const void *push, uint32_t push_bytes, uint32_t gx, uint32_t gy, uint32_t gz)

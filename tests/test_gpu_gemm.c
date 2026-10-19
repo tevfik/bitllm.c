@@ -149,6 +149,19 @@ static void run_attention(eif_gpu_context_t *gpu, int T, int H, int S, int D)
     char name[96];
     snprintf(name, sizeof(name), "attention T=%d H=%d S=%d D=%d", T, H, S, D);
     check(name, (const float *)eif_gpu_buf_map(bo), ref, mag, no, 1e-4);
+
+    if (D == 64 && eif_gpu_kernel_available(gpu, EIF_GPU_K_ATTENTION)) {
+        memset(eif_gpu_buf_map(bo), 0, no * sizeof(float));
+        eif_gpu_attn_pc_t ap = {(uint32_t)S, (uint32_t)H, (uint32_t)ld, (uint32_t)(H * D), 0, 0,
+                                0.125f * 1.4426950408889634f};
+        eif_gpu_buf_t *fb[5] = {bq, NULL, NULL, NULL, bo};
+        ok = eif_gpu_cmd_begin(gpu) &&
+             eif_gpu_cmd_dispatch(gpu, EIF_GPU_K_ATTENTION, fb, &ap, sizeof(ap), (S + 63) / 64, H, T);
+        ok = eif_gpu_cmd_submit(gpu) && ok;
+        snprintf(name, sizeof(name), "fused attention T=%d H=%d S=%d D=%d", T, H, S, D);
+        if (!ok) { printf("  FAIL  %s (dispatch failed)\n", name); g_fail++; }
+        else check(name, (const float *)eif_gpu_buf_map(bo), ref, mag, no, 1e-4);
+    }
     free(ref); free(mag); free(p);
 out:
     eif_gpu_buf_destroy(gpu, bq);
@@ -182,6 +195,8 @@ int main(void)
     run_case(&gpu, 1100, 768, 3072, true, true, 0, true);
     run_attention(&gpu, 2, 3, 70, 64);
     run_attention(&gpu, 1, 2, 129, 16);
+    run_attention(&gpu, 3, 2, 31, 64);
+    run_attention(&gpu, 1, 12, 1024, 64);
 
     eif_gpu_cleanup(&gpu);
     printf("%s\n", g_fail ? "SOME TESTS FAILED" : "ALL TESTS PASSED");

@@ -33,6 +33,7 @@ typedef struct {
 typedef struct {
     eif_gpu_context_t *ctx;
     bool q8;
+    bool flash;          /* fused attention kernel; otherwise QK^T, softmax and PV through a scores buffer */
     int max_batch;
     eif_gpu_buf_t *w;
     layer_off_t L[S_L];
@@ -150,7 +151,7 @@ static void free_acts(siglip_gpu_t *g)
 static bool alloc_acts(siglip_gpu_t *g, int B)
 {
     const size_t f = sizeof(float), rows = (size_t)B * S_NP;
-    size_t big = (size_t)B * S_HEADS * S_NP * S_NP;                  /* attention scores */
+    size_t big = g->flash ? 0 : (size_t)B * S_HEADS * S_NP * S_NP;  /* attention scores */
     if (big < rows * S_I) big = rows * S_I;                            /* MLP hidden */
     if (big < (size_t)B * S_NT * S_CIN) big = (size_t)B * S_NT * S_CIN; /* merged patches */
     if (big * f > eif_gpu_max_binding_bytes(g->ctx)) return false;
@@ -184,6 +185,8 @@ int eif_siglip_gpu_attach(eif_siglip_t *model, eif_gpu_context_t *ctx, int max_b
     if (!g) return -2;
     g->ctx = ctx;
     g->q8 = (model->header.qtype == EIF_SIGLIP_Q_INT8);
+    const char *fenv = getenv("BITLLM_GPU_FLASH");
+    g->flash = eif_gpu_kernel_available(ctx, EIF_GPU_K_ATTENTION) && !(fenv && strcmp(fenv, "0") == 0);
 
     wimg_t w = {NULL, 0};
     build_weights(&w, g, model, true, NULL);
@@ -273,41 +276,48 @@ static bool record_batch(siglip_gpu_t *g, int B)
                             rows, 3 * S_H, S_H, 0);
         eif_gpu_cmd_barrier(ctx);
 
-        /* scores[t, h] = Q_h K_h^T / 8 */
-        eif_gpu_gemm_pc_t pc;
-        memset(&pc, 0, sizeof(pc));
-        pc.M = S_NP; pc.N = S_NP; pc.K = S_HD;
-        pc.lda = 3 * S_H; pc.ldb = 3 * S_H; pc.ldc = S_NP;
-        pc.a_off = 0; pc.b_off = S_H;
-        pc.zdiv = S_HEADS;
-        pc.a_s1 = S_NP * 3 * S_H; pc.a_s2 = S_HD;
-        pc.b_s1 = S_NP * 3 * S_H; pc.b_s2 = S_HD;
-        pc.c_s1 = S_HEADS * S_NP * S_NP; pc.c_s2 = S_NP * S_NP;
-        pc.alpha = 0.125f;
-        ok = ok && eif_gpu_cmd_gemm(ctx, EIF_GPU_K_GEMM_F32, g->qkv, g->qkv, NULL, NULL, g->big, &pc,
-                                    (uint32_t)B * S_HEADS);
-        eif_gpu_cmd_barrier(ctx);
-        {
-            uint32_t sm[3] = {S_NP, (uint32_t)B * S_HEADS * S_NP, 0};
-            eif_gpu_buf_t *b[5] = {NULL, NULL, NULL, NULL, g->big};
-            ok = ok && eif_gpu_cmd_dispatch(ctx, EIF_GPU_K_SOFTMAX, b, sm, sizeof(sm),
-                                            sm[1] > 65535 ? 65535 : sm[1], 1, 1);
+        if (g->flash) {
+            eif_gpu_attn_pc_t ap = {S_NP, S_HEADS, 3 * S_H, S_H, 0, 0, 0.125f * 1.4426950408889634f};
+            eif_gpu_buf_t *b[5] = {g->qkv, NULL, NULL, NULL, g->attn};
+            ok = ok && eif_gpu_cmd_dispatch(ctx, EIF_GPU_K_ATTENTION, b, &ap, sizeof(ap), S_NP / 64, S_HEADS,
+                                            (uint32_t)B);
+            eif_gpu_cmd_barrier(ctx);
+        } else {
+            /* scores[t, h] = Q_h K_h^T / 8 */
+            eif_gpu_gemm_pc_t pc;
+            memset(&pc, 0, sizeof(pc));
+            pc.M = S_NP; pc.N = S_NP; pc.K = S_HD;
+            pc.lda = 3 * S_H; pc.ldb = 3 * S_H; pc.ldc = S_NP;
+            pc.a_off = 0; pc.b_off = S_H;
+            pc.zdiv = S_HEADS;
+            pc.a_s1 = S_NP * 3 * S_H; pc.a_s2 = S_HD;
+            pc.b_s1 = S_NP * 3 * S_H; pc.b_s2 = S_HD;
+            pc.c_s1 = S_HEADS * S_NP * S_NP; pc.c_s2 = S_NP * S_NP;
+            pc.alpha = 0.125f;
+            ok = ok && eif_gpu_cmd_gemm(ctx, EIF_GPU_K_GEMM_F32, g->qkv, g->qkv, NULL, NULL, g->big, &pc,
+                                        (uint32_t)B * S_HEADS);
+            eif_gpu_cmd_barrier(ctx);
+            {
+                uint32_t sm[3] = {S_NP, (uint32_t)B * S_HEADS * S_NP, 0};
+                eif_gpu_buf_t *b[5] = {NULL, NULL, NULL, NULL, g->big};
+                ok = ok && eif_gpu_cmd_dispatch(ctx, EIF_GPU_K_SOFTMAX, b, sm, sizeof(sm),
+                                                sm[1] > 65535 ? 65535 : sm[1], 1, 1);
+            }
+            eif_gpu_cmd_barrier(ctx);
+            /* attn[t, :, h] = P V_h */
+            memset(&pc, 0, sizeof(pc));
+            pc.M = S_NP; pc.N = S_HD; pc.K = S_NP;
+            pc.lda = S_NP; pc.ldb = 3 * S_H; pc.ldc = S_H;
+            pc.a_off = 0; pc.b_off = 2 * S_H;
+            pc.zdiv = S_HEADS;
+            pc.a_s1 = S_HEADS * S_NP * S_NP; pc.a_s2 = S_NP * S_NP;
+            pc.b_s1 = S_NP * 3 * S_H; pc.b_s2 = S_HD;
+            pc.c_s1 = S_NP * S_H; pc.c_s2 = S_HD;
+            pc.alpha = 1.0f;
+            ok = ok && eif_gpu_cmd_gemm(ctx, EIF_GPU_K_GEMM_KN, g->big, g->qkv, NULL, NULL, g->attn, &pc,
+                                        (uint32_t)B * S_HEADS);
+            eif_gpu_cmd_barrier(ctx);
         }
-        eif_gpu_cmd_barrier(ctx);
-        /* attn[t, :, h] = P V_h */
-        memset(&pc, 0, sizeof(pc));
-        pc.M = S_NP; pc.N = S_HD; pc.K = S_NP;
-        pc.lda = S_NP; pc.ldb = 3 * S_H; pc.ldc = S_H;
-        pc.a_off = 0; pc.b_off = 2 * S_H;
-        pc.zdiv = S_HEADS;
-        pc.a_s1 = S_HEADS * S_NP * S_NP; pc.a_s2 = S_NP * S_NP;
-        pc.b_s1 = S_NP * 3 * S_H; pc.b_s2 = S_HD;
-        pc.c_s1 = S_NP * S_H; pc.c_s2 = S_HD;
-        pc.alpha = 1.0f;
-        ok = ok && eif_gpu_cmd_gemm(ctx, EIF_GPU_K_GEMM_KN, g->big, g->qkv, NULL, NULL, g->attn, &pc,
-                                    (uint32_t)B * S_HEADS);
-        eif_gpu_cmd_barrier(ctx);
-
         ok = ok && rec_gemm(g, g->q8, g->attn, 0, S_H, o->o, o->o_s, o->o_b, g->x, S_H, rows, S_H, S_H,
                             EIF_GPU_GEMM_RESIDUAL);
         eif_gpu_cmd_barrier(ctx);

@@ -1,0 +1,126 @@
+#version 450
+/*
+ * 128x128 GEMM tile (BK = 8, double-buffered), 256 threads, 8x8 outputs per thread, vec4 loads. Same contract as
+ * gemm.comp (NT layout, FP32 or B_INT8 weights, batched strides, epilogue) but requires K, lda, ldb and all
+ * A/B offsets and strides to be multiples of 4 (the host picks gemm.comp otherwise).
+ */
+#extension GL_EXT_control_flow_attributes : enable
+
+#define BM 128
+#define BN 128
+#ifndef BK
+#define BK 8
+#endif
+
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer BufA { vec4 a4[]; };
+layout(std430, set = 0, binding = 1) readonly buffer BufB { uint b[]; };
+layout(std430, set = 0, binding = 1) readonly buffer BufB4 { uvec4 b4[]; };
+layout(std430, set = 0, binding = 2) readonly buffer BufS { float sc[]; };
+layout(std430, set = 0, binding = 3) readonly buffer BufBias { float bias[]; };
+layout(std430, set = 0, binding = 4) buffer BufC { float c[]; };
+
+layout(push_constant) uniform PC {
+    uint M, N, K;
+    uint lda, ldb, ldc;
+    uint a_off, b_off, c_off;
+    uint s_off, bias_off;
+    uint flags;
+    uint zdiv;
+    uint a_s1, a_s2, b_s1, b_s2, c_s1, c_s2;
+    float alpha;
+} p;
+
+vec4 load_b4(uint idx)
+{
+#if defined(B_INT8)
+    uint w = b[idx / 4u];
+    return vec4(bitfieldExtract(int(w), 0, 8), bitfieldExtract(int(w), 8, 8),
+                bitfieldExtract(int(w), 16, 8), bitfieldExtract(int(w), 24, 8));
+#else
+    return uintBitsToFloat(b4[idx / 4u]);
+#endif
+}
+
+shared vec4 As[2][BK][BM / 4];
+shared vec4 Bs[2][BK][BN / 4];
+
+#define LQ (BK / 8)   /* k quads loaded per thread and operand */
+
+void main()
+{
+    const uint tid = gl_LocalInvocationID.x;
+    const uint tx = tid % 16u, ty = tid / 16u;
+    const uint m0 = gl_WorkGroupID.y * BM, n0 = gl_WorkGroupID.x * BN;
+    const uint zo = gl_WorkGroupID.z / p.zdiv, zi = gl_WorkGroupID.z % p.zdiv;
+    const uint abase = p.a_off + zo * p.a_s1 + zi * p.a_s2;
+    const uint bbase = p.b_off + zo * p.b_s1 + zi * p.b_s2;
+    const uint cbase = p.c_off + zo * p.c_s1 + zi * p.c_s2;
+
+    /* loader: row lr (0..127) of the tile, k quads lk + 8 q */
+    const uint lr = tid / 2u, lk = (tid % 2u) * 4u;
+    const uint am = m0 + lr, bn = n0 + lr;
+
+    vec4 acc[8][2];
+    [[unroll]] for (int i = 0; i < 8; i++) { acc[i][0] = vec4(0.0); acc[i][1] = vec4(0.0); }
+
+    vec4 av[LQ], bv[LQ];
+    #define LOAD_TILE(k0)                                                                              \
+        [[unroll]] for (uint q = 0; q < LQ; q++) {                                                     \
+            const uint gk = (k0) + lk + 8u * q;                                                        \
+            av[q] = vec4(0.0); bv[q] = vec4(0.0);                                                      \
+            if (am < p.M && gk < p.K) av[q] = a4[(abase + am * p.lda + gk) / 4u];                      \
+            if (bn < p.N && gk < p.K) bv[q] = load_b4(bbase + bn * p.ldb + gk);                        \
+        }
+    #define STORE_TILE(buf)                                                                            \
+        [[unroll]] for (uint q = 0; q < LQ; q++) {                                                     \
+            [[unroll]] for (uint e = 0; e < 4u; e++) {                                                 \
+                As[buf][lk + 8u * q + e][lr / 4u][lr % 4u] = av[q][e];                                 \
+                Bs[buf][lk + 8u * q + e][lr / 4u][lr % 4u] = bv[q][e];                                 \
+            }                                                                                          \
+        }
+
+    LOAD_TILE(0u)
+    STORE_TILE(0u)
+    barrier();
+    uint cur = 0u;
+    for (uint k0 = 0; k0 < p.K; k0 += BK) {
+        const bool more = k0 + BK < p.K;
+        if (more) { LOAD_TILE(k0 + BK) }
+        [[unroll]] for (uint kk = 0; kk < BK; kk++) {
+            vec4 a0 = As[cur][kk][ty], a1 = As[cur][kk][ty + 16u];
+            vec4 b0 = Bs[cur][kk][tx], b1 = Bs[cur][kk][tx + 16u];
+            float ar[8] = float[8](a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w);
+            [[unroll]] for (int i = 0; i < 8; i++) {
+                acc[i][0] = fma(vec4(ar[i]), b0, acc[i][0]);
+                acc[i][1] = fma(vec4(ar[i]), b1, acc[i][1]);
+            }
+        }
+        if (more) { STORE_TILE(cur ^ 1u) }
+        barrier();
+        cur ^= 1u;
+    }
+
+    [[unroll]] for (uint i = 0; i < 8u; i++) {
+        uint gm = m0 + (i < 4u ? ty * 4u + i : 64u + ty * 4u + i - 4u);
+        if (gm >= p.M) continue;
+        [[unroll]] for (uint h = 0; h < 2u; h++) {
+            [[unroll]] for (uint j = 0; j < 4u; j++) {
+                uint gn = n0 + h * 64u + tx * 4u + j;
+                if (gn >= p.N) continue;
+                float v = acc[i][h][j] * p.alpha;
+                if ((p.flags & 8u) != 0u) v *= sc[p.s_off + gn];
+                if ((p.flags & 1u) != 0u) v += bias[p.bias_off + gn];
+                if ((p.flags & 2u) != 0u) {
+                    float u = 0.7978845608028654 * (v + 0.044715 * v * v * v);
+                    float t = 1.0 - 2.0 / (exp(2.0 * u) + 1.0);
+                    v = 0.5 * v * (1.0 + t);
+                }
+                uint ci = cbase + gm * p.ldc + gn;
+                if ((p.flags & 4u) != 0u) v += c[ci];
+                c[ci] = v;
+            }
+        }
+    }
+}

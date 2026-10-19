@@ -23,6 +23,7 @@ enum {
     EIF_GPU_K_SOFTMAX,
     EIF_GPU_K_BCAST,
     EIF_GPU_K_MERGE,
+    EIF_GPU_K_ATTENTION,
     EIF_GPU_K_COUNT
 };
 
@@ -42,6 +43,15 @@ typedef struct {
     uint32_t a_s1, a_s2, b_s1, b_s2, c_s1, c_s2;
     float alpha;
 } eif_gpu_gemm_pc_t;
+
+/* Mirrors shaders/attention.comp: grid (ceil(S / 64), heads, tiles), head dim 64. */
+typedef struct {
+    uint32_t S, heads, ld_in, ld_out, a_off, c_off;
+    float scale_log2;
+} eif_gpu_attn_pc_t;
+
+/* Fused attention needs ~35 KB of shared memory; false if the device cannot run a kernel. */
+bool eif_gpu_kernel_available(const eif_gpu_context_t *ctx, int kernel);
 
 /* host_visible: mapped, coherent (prefers device-local); otherwise device-local, filled via staging. */
 eif_gpu_buf_t *eif_gpu_buf_create(eif_gpu_context_t *ctx, size_t bytes, bool host_visible);
