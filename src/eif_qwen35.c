@@ -93,6 +93,7 @@ static void init_dense_lut(void) {
 
 #include "eif_quantize_bitnet.h"
 #include "eif_tinyllm.h"
+#include "eif_gemm.h"
 
 static inline size_t row_bytes(int cols, int quant_type) {
     if (quant_type == QWEN35_QTYPE_BITNET_DENSE) return (size_t)(cols + 4) / 5;
@@ -426,36 +427,21 @@ static void rope_partial(float *x, int pos, int n_heads, int head_dim) {
  * All buffers are allocated on the heap via the run state pool.
  * Uses stack-alloca for per-call scratch to avoid malloc overhead.
  * ============================================================ */
-static void deltanet_fwd(
-    float *out, const float *x,
-    qwen35_delta_weights_t *w,
-    qwen35_delta_state_t *st,
-    const qwen35_config_t *cfg,
-    float *scratch)   /* scratch: caller provides [conv_dim + 3*val_dim + 2*nv] */
+/* DeltaNet after the input projections (one token): causal conv1d, q/k L2 norm, gates, gated delta rule,
+ * gated RMSNorm. qkv_raw [conv_dim], z [val_dim], b/a [nv] are consumed; o_buf [val_dim] receives the input of
+ * out_proj, e_buf [val_dim] is scratch. */
+static void deltanet_core(float *qkv_raw, float *z_buf, float *b_buf, float *a_buf, float *o_buf, float *e_buf,
+                          qwen35_delta_weights_t *w, qwen35_delta_state_t *st, const qwen35_config_t *cfg)
 {
-    int dim      = cfg->dim;
-    int nk       = cfg->lin_n_k_heads;   /* 16 */
-    int kd       = cfg->lin_k_head_dim;  /* 128 */
-    int nv2      = cfg->lin_n_v_heads;   /* 16 */
-    int vd       = cfg->lin_v_head_dim;  /* 128 */
-    int key_dim  = nk * kd;              /* 2048 */
-    int val_dim  = nv2 * vd;             /* 2048 */
-    int conv_dim = key_dim*2 + val_dim;  /* 6144 */
-    int conv_k   = cfg->conv_k_size;     /* 4 */
-
-    float *qkv_raw = scratch;
-    float *z_buf   = scratch + conv_dim;
-    float *b_buf   = scratch + conv_dim + val_dim;
-    float *a_buf   = scratch + conv_dim + val_dim + nv2;
-    float *o_buf   = scratch + conv_dim + val_dim + nv2*2;
-    /* o_buf size = val_dim, then we need a retrieve scratch of vd */
-    float *e_buf   = scratch + conv_dim + val_dim*2 + nv2*2;  /* [vd] */
-
-    /* Projections */
-    linear_gemv(qkv_raw, w->qkv,    w->qkv_s, x, conv_dim, dim, cfg->quant_lm);
-    linear_gemv(z_buf,   w->z,      w->z_s,   x, val_dim,  dim, cfg->quant_lm);
-    linear_gemv(b_buf,   w->proj_b, w->b_s,   x, nv2, dim,      cfg->quant_lm);
-    linear_gemv(a_buf,   w->proj_a, w->a_s,   x, nv2, dim,      cfg->quant_lm);
+    int nk       = cfg->lin_n_k_heads;
+    int kd       = cfg->lin_k_head_dim;
+    int nv2      = cfg->lin_n_v_heads;
+    int vd       = cfg->lin_v_head_dim;
+    int key_dim  = nk * kd;
+    int val_dim  = nv2 * vd;
+    int conv_dim = key_dim*2 + val_dim;
+    int conv_k   = cfg->conv_k_size;
+    (void)val_dim;
 
 
     /* Causal Conv1d sliding window update */
@@ -554,42 +540,55 @@ static void deltanet_fwd(
     }
 
 
+}
+
+static void deltanet_fwd(
+    float *out, const float *x,
+    qwen35_delta_weights_t *w,
+    qwen35_delta_state_t *st,
+    const qwen35_config_t *cfg,
+    float *scratch)   /* scratch: caller provides [conv_dim + 3*val_dim + 2*nv] */
+{
+    int dim      = cfg->dim;
+    int nk       = cfg->lin_n_k_heads;   /* 16 */
+    int kd       = cfg->lin_k_head_dim;  /* 128 */
+    int nv2      = cfg->lin_n_v_heads;   /* 16 */
+    int vd       = cfg->lin_v_head_dim;  /* 128 */
+    int key_dim  = nk * kd;              /* 2048 */
+    int val_dim  = nv2 * vd;             /* 2048 */
+    int conv_dim = key_dim*2 + val_dim;  /* 6144 */
+
+    float *qkv_raw = scratch;
+    float *z_buf   = scratch + conv_dim;
+    float *b_buf   = scratch + conv_dim + val_dim;
+    float *a_buf   = scratch + conv_dim + val_dim + nv2;
+    float *o_buf   = scratch + conv_dim + val_dim + nv2*2;
+    /* o_buf size = val_dim, then we need a retrieve scratch of vd */
+    float *e_buf   = scratch + conv_dim + val_dim*2 + nv2*2;  /* [vd] */
+
+    /* Projections */
+    linear_gemv(qkv_raw, w->qkv,    w->qkv_s, x, conv_dim, dim, cfg->quant_lm);
+    linear_gemv(z_buf,   w->z,      w->z_s,   x, val_dim,  dim, cfg->quant_lm);
+    linear_gemv(b_buf,   w->proj_b, w->b_s,   x, nv2, dim,      cfg->quant_lm);
+    linear_gemv(a_buf,   w->proj_a, w->a_s,   x, nv2, dim,      cfg->quant_lm);
+
+    deltanet_core(qkv_raw, z_buf, b_buf, a_buf, o_buf, e_buf, w, st, cfg);
+
     /* Output projection */
     linear_gemv(out, w->out, w->out_s, o_buf, dim, val_dim, cfg->quant_lm);
 }
 
-/* ============================================================
- * Full Attention forward (GQA + partial RoPE + output gate)
- * ============================================================ */
-static void fullatt_fwd(
-    float *out, const float *x,
-    qwen35_attn_weights_t *w,
-    qwen35_attn_state_t *st,
-    int pos, const qwen35_config_t *cfg,
-    float *q_buf, float *k_buf, float *v_buf, float *att_buf)
+/* Full attention, one token after the q/k/v projections: split the interleaved [q, gate] heads, q/k RMSNorm,
+ * partial RoPE, append k/v to the cache at pos. q_buf / gate_buf [q_dim] receive the rotated query and the gate. */
+static void fullatt_prep(const float *qg_buf, float *k_buf, const float *v_buf, float *q_buf, float *gate_buf,
+                         qwen35_attn_weights_t *w, qwen35_attn_state_t *st, int pos, const qwen35_config_t *cfg)
 {
-    int dim     = cfg->dim;
-    int nh      = cfg->n_heads;       /* 8 */
-    int nkv     = cfg->n_kv_heads;    /* 2 */
-    int hd      = cfg->head_dim;      /* 256 */
-    int q_dim   = nh  * hd;           /* 2048 */
-    int qg_dim  = q_dim * 2;          /* 4096 (query + gate) */
-    int kv_dim  = nkv * hd;           /* 512 */
-    int ng      = nh / nkv;           /* 4  (GQA groups) */
-    float scale = 1.0f / sqrtf((float)hd);
+    int nh     = cfg->n_heads;
+    int nkv    = cfg->n_kv_heads;
+    int hd     = cfg->head_dim;
+    int kv_dim = nkv * hd;
 
-    float *qg_buf    = (float *)alloca(qg_dim * sizeof(float));
-    float *gate_buf  = (float *)alloca(q_dim * sizeof(float));
-    /* Attention output is q_dim wide (nh*hd), which is larger than the caller's
-     * residual buffer (dim). Keep it in a dedicated q_dim scratch and only
-     * project into `out` at the end. */
-    float *attn_out  = (float *)alloca(q_dim * sizeof(float));
-
-    linear_gemv(qg_buf, w->q, w->q_s, x, qg_dim,  dim, cfg->quant_lm);
-    linear_gemv(k_buf,  w->k, w->k_s, x, kv_dim,  dim, cfg->quant_lm);
-    linear_gemv(v_buf,  w->v, w->v_s, x, kv_dim,  dim, cfg->quant_lm);
-
-    /* Unpack interleaved [q, gate] per head: each head has 2*hd = 512 elements */
+    /* Unpack interleaved [q, gate] per head: each head has 2*hd elements */
     for (int h = 0; h < nh; h++) {
         const float *src = qg_buf + h * (hd * 2);
         memcpy(q_buf + h * hd, src, hd * sizeof(float));
@@ -612,7 +611,6 @@ static void fullatt_fwd(
         for (int i = 0; i < hd; i++) kh[i] = kh[i]*inv*w->k_norm[i];
     }
 
-
     /* Partial RoPE */
     rope_partial(q_buf, pos, nh,  hd);
     rope_partial(k_buf, pos, nkv, hd);
@@ -620,6 +618,20 @@ static void fullatt_fwd(
     /* Store in KV cache */
     memcpy(st->k_cache + (size_t)pos * kv_dim, k_buf, kv_dim * sizeof(float));
     memcpy(st->v_cache + (size_t)pos * kv_dim, v_buf, kv_dim * sizeof(float));
+}
+
+/* Attention of a prepared query over cache[0..pos] (GQA), sigmoid output gate, SubLN: o_in [q_dim] = input of
+ * o_proj (may alias q_buf). attn_out [q_dim] and att_buf [n_heads * (pos+1)] are scratch. */
+static void fullatt_attend(const float *q_buf, const float *gate_buf, float *o_in, float *attn_out, float *att_buf,
+                           qwen35_attn_state_t *st, const float *sub_norm, int pos, const qwen35_config_t *cfg)
+{
+    int nh     = cfg->n_heads;
+    int nkv    = cfg->n_kv_heads;
+    int hd     = cfg->head_dim;
+    int q_dim  = nh * hd;
+    int kv_dim = nkv * hd;
+    int ng     = nh / nkv;
+    float scale = 1.0f / sqrtf((float)hd);
 
     /* Multi-head attention (GQA) */
     for (int h = 0; h < nh; h++) {
@@ -648,23 +660,69 @@ static void fullatt_fwd(
         attn_out[i] *= g;
     }
 
-    /* Output projection with SubLN */
+    /* SubLN before the output projection */
     float ss_o = 0.0f;
     for (int i = 0; i < q_dim; i++) ss_o += attn_out[i] * attn_out[i];
     float inv_rms_o = 1.0f / sqrtf(ss_o / q_dim + 1e-6f);
-    if (w->sub_norm) {
-        for (int i = 0; i < q_dim; i++) q_buf[i] = attn_out[i] * inv_rms_o * w->sub_norm[i];
+    if (sub_norm) {
+        for (int i = 0; i < q_dim; i++) o_in[i] = attn_out[i] * inv_rms_o * sub_norm[i];
     } else if (!cfg->plain_linear) {
-        for (int i = 0; i < q_dim; i++) q_buf[i] = attn_out[i] * inv_rms_o;
+        for (int i = 0; i < q_dim; i++) o_in[i] = attn_out[i] * inv_rms_o;
     } else {
-        memcpy(q_buf, attn_out, q_dim * sizeof(float));
+        memcpy(o_in, attn_out, q_dim * sizeof(float));
     }
+}
+
+/* ============================================================
+ * Full Attention forward (GQA + partial RoPE + output gate)
+ * ============================================================ */
+static void fullatt_fwd(
+    float *out, const float *x,
+    qwen35_attn_weights_t *w,
+    qwen35_attn_state_t *st,
+    int pos, const qwen35_config_t *cfg,
+    float *q_buf, float *k_buf, float *v_buf, float *att_buf)
+{
+    int dim     = cfg->dim;
+    int q_dim   = cfg->n_heads * cfg->head_dim;
+    int qg_dim  = q_dim * 2;
+    int kv_dim  = cfg->n_kv_heads * cfg->head_dim;
+
+    float *qg_buf    = (float *)alloca(qg_dim * sizeof(float));
+    float *gate_buf  = (float *)alloca(q_dim * sizeof(float));
+    /* Attention output is q_dim wide (nh*hd), which is larger than the caller's
+     * residual buffer (dim). Keep it in a dedicated q_dim scratch and only
+     * project into `out` at the end. */
+    float *attn_out  = (float *)alloca(q_dim * sizeof(float));
+
+    linear_gemv(qg_buf, w->q, w->q_s, x, qg_dim,  dim, cfg->quant_lm);
+    linear_gemv(k_buf,  w->k, w->k_s, x, kv_dim,  dim, cfg->quant_lm);
+    linear_gemv(v_buf,  w->v, w->v_s, x, kv_dim,  dim, cfg->quant_lm);
+
+    fullatt_prep(qg_buf, k_buf, v_buf, q_buf, gate_buf, w, st, pos, cfg);
+    fullatt_attend(q_buf, gate_buf, q_buf, attn_out, att_buf, st, w->sub_norm, pos, cfg);
     linear_gemv(out, w->o, w->o_s, q_buf, dim, q_dim, cfg->quant_lm);
 }
 
 /* ============================================================
  * SwiGLU FFN
  * ============================================================ */
+/* hb = SubLN(silu(gate) * up): input of down_proj */
+static void ffn_act(float *hb, const float *hb2, const float *sub_norm, int h_dim, int plain)
+{
+    for (int i = 0; i < h_dim; i++) hb[i] = silu(hb[i]) * hb2[i];
+
+    /* SubLN (RMSNorm) for BitLinear down_proj */
+    float ss_d = 0.0f;
+    for (int i = 0; i < h_dim; i++) ss_d += hb[i] * hb[i];
+    float inv_rms_d = 1.0f / sqrtf(ss_d / h_dim + 1e-6f);
+    if (sub_norm) {
+        for (int i = 0; i < h_dim; i++) hb[i] = hb[i] * inv_rms_d * sub_norm[i];
+    } else if (!plain) {
+        for (int i = 0; i < h_dim; i++) hb[i] *= inv_rms_d;
+    }
+}
+
 static void ffn_swiglu(float *out, const float *x,
                        qwen35_ffn_weights_t *w,
                        float *hb, float *hb2, int dim, int h_dim, int quant_type, int plain) {
@@ -677,18 +735,7 @@ static void ffn_swiglu(float *out, const float *x,
         linear_gemv(hb2, w->up,   w->up_s,   x, h_dim, dim, quant_type);
     }
 
-    for (int i = 0; i < h_dim; i++) hb[i] = silu(hb[i]) * hb2[i];
-
-    /* SubLN (RMSNorm) for BitLinear down_proj */
-    float ss_d = 0.0f;
-    for (int i = 0; i < h_dim; i++) ss_d += hb[i] * hb[i];
-    float inv_rms_d = 1.0f / sqrtf(ss_d / h_dim + 1e-6f);
-    if (w->sub_norm) {
-        for (int i = 0; i < h_dim; i++) hb[i] = hb[i] * inv_rms_d * w->sub_norm[i];
-    } else if (!plain) {
-        for (int i = 0; i < h_dim; i++) hb[i] *= inv_rms_d;
-    }
-
+    ffn_act(hb, hb2, w->sub_norm, h_dim, plain);
     linear_gemv(out, w->down, w->down_s, hb, dim, h_dim, quant_type);
 }
 
@@ -821,6 +868,190 @@ void qwen35_inject_visual(qwen35_t *m, const float *embs, int n_tok, int start_p
         }
     }
     s->pos = start_pos + n_tok;
+}
+
+/* ============================================================
+ * Batched prefill: projections / FFN as blocked GEMMs over a chunk of tokens,
+ * DeltaNet recurrence and KV-cache appends in token order.
+ * ============================================================ */
+
+#define Q35_PREFILL_CHUNK 64
+#define Q35_GEMM_ROWS 64
+
+/* One weight row dequantised to FP32 with its row scale (FP32 weights carry no scale, as in f32_gemv). */
+static void dequant_row(float *dst, const void *W, const float *sc, int r, int cols, int qt)
+{
+    const uint8_t *row = (const uint8_t *)W + (size_t)r * row_bytes(cols, qt);
+    if (qt == QWEN35_QTYPE_FP32) {
+        memcpy(dst, row, (size_t)cols * sizeof(float));
+        return;
+    }
+    float s = sc[r];
+    if (qt == QWEN35_QTYPE_BITNET_DENSE) {
+        init_dense_lut();
+        for (int c = 0, b = 0; c < cols; b++)
+            for (int i = 0; i < 5 && c < cols; i++, c++) dst[c] = s_dense_lut_f[row[b]][i] * s;
+    } else if (qt == QWEN35_QTYPE_INT4) {
+        for (int c = 0; c < cols; c++) {
+            uint8_t byte = row[c >> 1];
+            int v = (c & 1) ? (byte & 0x0F) - 8 : ((byte >> 4) & 0x0F) - 8;
+            dst[c] = (float)v * s;
+        }
+    } else { /* BITNET_2BIT */
+        for (int c = 0; c < cols; c++) dst[c] = (float)eif_unpack_ternary(row[c >> 2], c & 3) * s;
+    }
+}
+
+/* Y[n, rows] = X[n, cols] W^T: blocks of weight rows decoded once per call and applied to all n tokens. */
+static void linear_gemm(float *Y, const void *W, const float *sc, const float *X, int n, int rows, int cols, int qt)
+{
+    if (qt == QWEN35_QTYPE_FP32) {
+        eif_gemm_f32_nt((const float *)X, (const float *)W, NULL, Y, n, rows, cols, EIF_GEMM_ACT_NONE, 0);
+        return;
+    }
+    const int nblk = (rows + Q35_GEMM_ROWS - 1) / Q35_GEMM_ROWS;
+    #pragma omp parallel
+    {
+        float *wf = (float *)malloc(sizeof(float) * Q35_GEMM_ROWS * (size_t)cols);
+        #pragma omp for schedule(dynamic, 1)
+        for (int bi = 0; bi < nblk; bi++) {
+            int r0 = bi * Q35_GEMM_ROWS;
+            int rb = (rows - r0 < Q35_GEMM_ROWS) ? rows - r0 : Q35_GEMM_ROWS;
+            if (wf) {
+                for (int r = 0; r < rb; r++) dequant_row(wf + (size_t)r * cols, W, sc, r0 + r, cols, qt);
+                eif_gemm_f32_nt_ld(X, cols, wf, cols, NULL, Y + r0, rows, n, rb, cols, EIF_GEMM_ACT_NONE, 0);
+            } else { /* out of memory: one row at a time */
+                float row[cols];
+                for (int r = r0; r < r0 + rb; r++) {
+                    dequant_row(row, W, sc, r, cols, qt);
+                    for (int t = 0; t < n; t++) {
+                        float acc = 0.0f;
+                        for (int c = 0; c < cols; c++) acc += row[c] * X[(size_t)t * cols + c];
+                        Y[(size_t)t * rows + r] = acc;
+                    }
+                }
+            }
+        }
+        free(wf);
+    }
+}
+
+static int prefill_chunk(qwen35_t *m, const float *emb, int n, int start_pos)
+{
+    const qwen35_config_t *cfg = &m->config;
+    qwen35_weights_t *w = &m->weights;
+    qwen35_state_t *s = &m->state;
+    const int dim = cfg->dim, hidden = cfg->hidden_dim, qt = cfg->quant_lm;
+    const int nv2 = cfg->lin_n_v_heads, key_dim = cfg->lin_n_k_heads * cfg->lin_k_head_dim;
+    const int val_dim = nv2 * cfg->lin_v_head_dim, conv_dim = key_dim * 2 + val_dim;
+    const int q_dim = cfg->n_heads * cfg->head_dim, kv_dim = cfg->n_kv_heads * cfg->head_dim;
+    const int wide = conv_dim > 2 * q_dim ? conv_dim : 2 * q_dim;
+
+    float *X   = (float *)malloc(sizeof(float) * (size_t)n * dim);
+    float *XB  = (float *)malloc(sizeof(float) * (size_t)n * dim);
+    float *OUT = (float *)malloc(sizeof(float) * (size_t)n * dim);
+    float *P0  = (float *)malloc(sizeof(float) * (size_t)n * (wide > hidden ? wide : hidden)); /* qkv | qg | gate */
+    float *P1  = (float *)malloc(sizeof(float) * (size_t)n * (val_dim > hidden ? val_dim : hidden)); /* z | up */
+    float *P2  = (float *)malloc(sizeof(float) * (size_t)n * (q_dim > val_dim ? q_dim : val_dim) * 2); /* o | q,gate */
+    float *P3  = (float *)malloc(sizeof(float) * (size_t)n * (2 * nv2 + 2 * kv_dim));      /* b,a | k,v */
+    float *E   = (float *)malloc(sizeof(float) * (size_t)val_dim);
+    if (!X || !XB || !OUT || !P0 || !P1 || !P2 || !P3 || !E) {
+        free(X); free(XB); free(OUT); free(P0); free(P1); free(P2); free(P3); free(E);
+        return -1;
+    }
+    memcpy(X, emb, sizeof(float) * (size_t)n * dim);
+
+    int dn = 0, fa = 0;
+    for (int l = 0; l < cfg->n_layers; l++) {
+        for (int t = 0; t < n; t++) rmsnorm(XB + (size_t)t * dim, X + (size_t)t * dim, w->rms_att[l], dim);
+
+        if (m->layer_types[l] == QWEN35_LAYER_DELTANET) {
+            qwen35_delta_weights_t *dw = &w->delta[dn];
+            float *B = P3, *A = P3 + (size_t)n * nv2;
+            linear_gemm(P0, dw->qkv, dw->qkv_s, XB, n, conv_dim, dim, qt);
+            linear_gemm(P1, dw->z, dw->z_s, XB, n, val_dim, dim, qt);
+            linear_gemm(B, dw->proj_b, dw->b_s, XB, n, nv2, dim, qt);
+            linear_gemm(A, dw->proj_a, dw->a_s, XB, n, nv2, dim, qt);
+            for (int t = 0; t < n; t++)
+                deltanet_core(P0 + (size_t)t * conv_dim, P1 + (size_t)t * val_dim, B + (size_t)t * nv2,
+                              A + (size_t)t * nv2, P2 + (size_t)t * val_dim, E, dw, &s->delta[dn], cfg);
+            linear_gemm(OUT, dw->out, dw->out_s, P2, n, dim, val_dim, qt);
+            dn++;
+        } else {
+            qwen35_attn_weights_t *aw = &w->full[fa];
+            qwen35_attn_state_t *as = &s->attn[fa];
+            float *K = P3, *V = P3 + (size_t)n * kv_dim, *Q = P2, *G = P2 + (size_t)n * q_dim;
+            linear_gemm(P0, aw->q, aw->q_s, XB, n, 2 * q_dim, dim, qt);
+            linear_gemm(K, aw->k, aw->k_s, XB, n, kv_dim, dim, qt);
+            linear_gemm(V, aw->v, aw->v_s, XB, n, kv_dim, dim, qt);
+            for (int t = 0; t < n; t++)
+                fullatt_prep(P0 + (size_t)t * 2 * q_dim, K + (size_t)t * kv_dim, V + (size_t)t * kv_dim,
+                             Q + (size_t)t * q_dim, G + (size_t)t * q_dim, aw, as, start_pos + t, cfg);
+            /* every k/v of the chunk is cached: queries are independent now (causal bound pos) */
+            #pragma omp parallel
+            {
+                float *att = (float *)malloc(sizeof(float) * (size_t)cfg->n_heads * (start_pos + n));
+                float *ao = (float *)malloc(sizeof(float) * (size_t)q_dim);
+                #pragma omp for schedule(dynamic, 1)
+                for (int t = 0; t < n; t++)
+                    if (att && ao)
+                        fullatt_attend(Q + (size_t)t * q_dim, G + (size_t)t * q_dim, P0 + (size_t)t * q_dim, ao,
+                                       att, as, aw->sub_norm, start_pos + t, cfg);
+                free(att);
+                free(ao);
+            }
+            linear_gemm(OUT, aw->o, aw->o_s, P0, n, dim, q_dim, qt);
+            fa++;
+        }
+        for (size_t i = 0; i < (size_t)n * dim; i++) X[i] += OUT[i];
+
+        for (int t = 0; t < n; t++) rmsnorm(XB + (size_t)t * dim, X + (size_t)t * dim, w->rms_ffn[l], dim);
+        linear_gemm(P0, w->ffn[l].gate, w->ffn[l].gate_s, XB, n, hidden, dim, qt);
+        linear_gemm(P1, w->ffn[l].up, w->ffn[l].up_s, XB, n, hidden, dim, qt);
+        for (int t = 0; t < n; t++)
+            ffn_act(P0 + (size_t)t * hidden, P1 + (size_t)t * hidden, w->ffn[l].sub_norm, hidden, cfg->plain_linear);
+        linear_gemm(OUT, w->ffn[l].down, w->ffn[l].down_s, P0, n, dim, hidden, qt);
+        for (size_t i = 0; i < (size_t)n * dim; i++) X[i] += OUT[i];
+    }
+    memcpy(s->x, X + (size_t)(n - 1) * dim, sizeof(float) * dim);
+    free(X); free(XB); free(OUT); free(P0); free(P1); free(P2); free(P3); free(E);
+    return 0;
+}
+
+float *qwen35_prefill_embeds(qwen35_t *m, const float *embs, int n_tok, int start_pos, bool compute_logits)
+{
+    const qwen35_config_t *cfg = &m->config;
+    qwen35_weights_t *w = &m->weights;
+    qwen35_state_t *s = &m->state;
+    if (n_tok <= 0 || start_pos < 0 || start_pos + n_tok > cfg->max_seq_len) return NULL;
+    for (int c0 = 0; c0 < n_tok; c0 += Q35_PREFILL_CHUNK) {
+        int n = (n_tok - c0 < Q35_PREFILL_CHUNK) ? n_tok - c0 : Q35_PREFILL_CHUNK;
+        if (prefill_chunk(m, embs + (size_t)c0 * cfg->dim, n, start_pos + c0) != 0) return NULL;
+    }
+    rmsnorm(s->xb, s->x, w->rms_final, cfg->dim);
+    s->pos = start_pos + n_tok;
+    if (!compute_logits) return s->xb;
+    const uint8_t *E = (const uint8_t *)w->embed;
+    if (cfg->quant_embed == QWEN35_EMBED_INT8) {
+        int8_gemv(s->logits, (const int8_t *)E, w->embed_s, s->xb, cfg->vocab_size, cfg->dim);
+    } else {
+        linear_gemv(s->logits, E, w->embed_s, s->xb, cfg->vocab_size, cfg->dim, embed_to_weight_qtype(cfg->quant_embed));
+    }
+    return s->logits;
+}
+
+float *qwen35_prefill(qwen35_t *m, const int *toks, int n_tok, int start_pos, bool compute_logits)
+{
+    const qwen35_config_t *cfg = &m->config;
+    if (n_tok <= 0) return NULL;
+    float *embs = (float *)malloc(sizeof(float) * (size_t)n_tok * cfg->dim);
+    if (!embs) return NULL;
+    for (int t = 0; t < n_tok; t++)
+        embed_lookup(embs + (size_t)t * cfg->dim, (const uint8_t *)m->weights.embed, m->weights.embed_s, toks[t],
+                     cfg->dim, cfg->quant_embed);
+    float *r = qwen35_prefill_embeds(m, embs, n_tok, start_pos, compute_logits);
+    free(embs);
+    return r;
 }
 
 /* ============================================================

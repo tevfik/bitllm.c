@@ -274,6 +274,16 @@ float *qwen35_forward_ex(qwen35_t *model, int tok, int pos, bool compute_logits)
 float *qwen35_forward_no_logits(qwen35_t *model, int tok, int pos);
 
 /**
+ * @brief Batched prefill of n_tok tokens at positions start_pos.. (same result as n_tok qwen35_forward calls up to
+ *        float reassociation). Weight rows are decoded once per 64-token chunk and applied with a blocked GEMM.
+ * @return Logits of the last token (or its normalised hidden state when !compute_logits), NULL on error.
+ */
+float *qwen35_prefill(qwen35_t *model, const int *toks, int n_tok, int start_pos, bool compute_logits);
+
+/** @brief As qwen35_prefill, from input embeddings [n_tok, dim] (e.g. visual tokens). */
+float *qwen35_prefill_embeds(qwen35_t *model, const float *embs, int n_tok, int start_pos, bool compute_logits);
+
+/**
  * @brief Get pointer to last computed normalized hidden state vector [dim].
  *
  * @param model Loaded model.
