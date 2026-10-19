@@ -16,7 +16,7 @@ Designed from the ground up for seamless embedding into applications (such as [g
 - **Embedded Byte-Level BPE Tokenizer**: 100% byte-exact parity with HuggingFace tokenizers via C99 pre-tokenization regex and rank-based BPE merges.
 - **Flexible Memory Model**: Designed for embedding without rigid MCU limitations; supports system allocators or custom user-provided memory pools.
 - **Dual Format Support**: Reads `.eifm` (Edge Intelligence Format Model) and `.gguf` weights directly.
-- **Optional Vulkan GPU Compute**: Hardware acceleration via Vulkan compute shaders when available, gracefully falling back to AVX2/NEON/OpenMP CPU execution.
+- **Optional Vulkan GPU Compute**: the SigLIP2 vision encoder runs on any Vulkan GPU (`--gpu`); the loader is opened at runtime, so builds need no Vulkan SDK and machines without a GPU fall back to the AVX2/NEON/OpenMP CPU path.
 
 ---
 
@@ -80,9 +80,31 @@ cmake --build build -j$(nproc)
 [`tevfikk/granite-docling-258M-bitnet`](https://huggingface.co/tevfikk/granite-docling-258M-bitnet)
 (`granite_docling_bitnet_dense.eifm` + `tokenizer.bin`). Its vision tower is stored as **INT8 per-row weights**
 (`SVLM` config, SigLIP header `qtype = 1`); INT4 per group, optionally with a Walsh-Hadamard rotation, is supported too
-(`qtype = 2`, see `include/eif_siglip.h`). Each ViT matrix is dequantised into a scratch buffer right before its GEMM.
+(`qtype = 2`, see `include/eif_siglip.h`). On the CPU each ViT matrix is dequantised into a scratch buffer right before its GEMM.
 Runtimes older than this support reading the model silently produce no output ("Generated Tokens: -3").
 This project was previously published as `eif-runtime`.
+
+### 4. GPU vision encoder (Vulkan)
+
+```bash
+./build/bitllm-run path/to/granite_docling_bitnet_dense.eifm --image page.png --gpu
+```
+
+With `--gpu` (or, from C, an initialised `llm.gpu` / `eif_siglip_use_gpu()`), the whole ViT + connector runs on the
+GPU: weights are uploaded once (INT8 ViT weights stay INT8 and are dequantised inside the GEMM kernel), and a batch of
+tiles goes through patch embedding, the 12 layers (layernorm, fused attention, GELU MLP, residuals) and the connector in
+one command-buffer submit. The language model still runs on the CPU. GPU and CPU visual tokens agree to cosine
+1.0000000 (max abs difference ~1e-3 on values up to ~200).
+
+- Build: `BITLLM_ENABLE_VULKAN` defaults to ON on Linux/Windows/macOS/Android and only needs `dl`; there is no link
+  against libvulkan. Embedded/bare-metal targets (`CMAKE_SYSTEM_NAME` Generic) keep it OFF.
+- Runtime: needs a Vulkan loader (`libvulkan.so.1`, `vulkan-1.dll`) and a GPU driver; otherwise `eif_gpu_init()` returns
+  false and everything runs on the CPU unchanged.
+- Environment: `BITLLM_NO_GPU=1` disables the backend, `BITLLM_GPU_TILE_BATCH=n` sets tiles per submit (default 8,
+  ~35 MB of GPU memory per tile plus the weights), `BITLLM_GPU_FLASH=0` forces the unfused attention path,
+  `BITLLM_GPU_ALLOW_CPU=1` accepts software devices such as llvmpipe (testing), `BITLLM_VULKAN_LIB` overrides the loader.
+- Shaders: sources in `shaders/*.comp`; `scripts/gen_spv.sh [glslangValidator]` regenerates the committed
+  `src/eif_vk_shaders.h`, so normal builds need no shader compiler.
 
 ---
 

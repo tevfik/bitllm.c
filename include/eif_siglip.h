@@ -155,6 +155,7 @@ int eif_siglip_dequant_weight(const eif_siglip_t *model, int l, int m, float *ou
  * @param ctx Initialised GPU context to share (must outlive the model), or NULL to create one owned by the model.
  * @return 0 if the GPU path is active; negative if unavailable (the model keeps encoding on the CPU).
  *         BITLLM_GPU_TILE_BATCH sets the tiles per submit (default 8; reduced to fit device memory limits).
+ *         A GPU context is not thread-safe: do not encode concurrently with models sharing one context.
  */
 int eif_siglip_use_gpu(eif_siglip_t *model, eif_gpu_context_t *ctx);
 

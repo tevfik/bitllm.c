@@ -160,7 +160,11 @@ int main(int argc, char **argv)
     }
     printf("  Device: %s\n", probe.device_name);
     eif_gpu_cleanup(&probe);
+#if defined(_WIN32)
+    _putenv_s("BITLLM_GPU_TILE_BATCH", "2");
+#else
     setenv("BITLLM_GPU_TILE_BATCH", "2", 1);
+#endif
 
     const int n = 3;
     float *tiles = (float *)malloc((size_t)n * TILE * sizeof(float));

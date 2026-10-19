@@ -48,7 +48,7 @@ static void print_usage(const char *prog)
     printf("  --top-p <float>          Nucleus top-p threshold (default: 0.9)\n");
     printf("  -r, --rep-penalty <val>  Repetition penalty factor (default: 1.15, 1.0=none; 1.0 with --image)\n");
     printf("  --no-loop-guard          Do not stop DocTags generation that repeats one pattern (--image)\n");
-    printf("  --gpu                    Attempt GPU compute acceleration (graceful CPU fallback)\n");
+    printf("  --gpu                    Run the vision encoder on a Vulkan GPU (graceful CPU fallback)\n");
     printf("  --kv-int8                Enable INT8 quantized KV cache (75%% memory reduction)\n\n");
     printf("Examples:\n");
     printf("  %s models/dist/granite-30m-q8_0.gguf --embed \"Artificial intelligence and edge computing\"\n", prog);
@@ -239,7 +239,8 @@ int main(int argc, char **argv)
     if (use_gpu) {
         eif_gpu_init(&llm.gpu);
         if (eif_gpu_is_available(&llm.gpu)) {
-            printf("  • Compute Unit: GPU [%s] (%s)\n", llm.gpu.device_name, llm.gpu.backend_name);
+            printf("  • Compute Unit: GPU [%s] (%s) for the vision encoder, CPU for the LM\n", llm.gpu.device_name,
+                   llm.gpu.backend_name);
         } else {
             printf("  • Compute Unit: CPU Native [T-MAC / NEON] (GPU requested but unavailable on this device)\n");
         }
