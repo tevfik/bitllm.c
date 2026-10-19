@@ -1,0 +1,47 @@
+#version 450
+/* Row-wise LayerNorm: C[r, :] = (A[r, :] - mean) / sqrt(var + eps) * S[w_off + :] + S[b_off + :]; in-place safe. */
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) buffer BufA { float a[]; };
+layout(std430, set = 0, binding = 2) readonly buffer BufS { float sc[]; };
+layout(std430, set = 0, binding = 4) buffer BufC { float c[]; };
+
+layout(push_constant) uniform PC {
+    uint N, rows;
+    uint a_off, c_off;
+    uint w_off, b_off;
+    float eps;
+} p;
+
+shared float red[256];
+
+float block_sum(float v)
+{
+    uint t = gl_LocalInvocationID.x;
+    red[t] = v;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1) {
+        if (t < s) red[t] += red[t + s];
+        barrier();
+    }
+    float r = red[0];
+    barrier();
+    return r;
+}
+
+void main()
+{
+    const uint t = gl_LocalInvocationID.x;
+    for (uint row = gl_WorkGroupID.x; row < p.rows; row += gl_NumWorkGroups.x) {
+        uint ai = p.a_off + row * p.N, ci = p.c_off + row * p.N;
+        float s = 0.0;
+        for (uint i = t; i < p.N; i += 256u) s += a[ai + i];
+        float mean = block_sum(s) / float(p.N);
+        float q = 0.0;
+        for (uint i = t; i < p.N; i += 256u) { float d = a[ai + i] - mean; q += d * d; }
+        float inv = inversesqrt(block_sum(q) / float(p.N) + p.eps);
+        for (uint i = t; i < p.N; i += 256u)
+            c[ci + i] = (a[ai + i] - mean) * inv * sc[p.w_off + i] + sc[p.b_off + i];
+        barrier();
+    }
+}

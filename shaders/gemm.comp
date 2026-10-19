@@ -1,0 +1,137 @@
+#version 450
+/*
+ * Tiled GEMM: C[m, n] = epilogue(alpha * sum_k A[m, k] * B(n, k)), batched over gl_WorkGroupID.z.
+ *   default : B is FP32 [N, K] (row n contiguous, "NT", i.e. nn.Linear weights or K of attention)
+ *   B_INT8  : B is INT8 [N, K] packed 4 per uint, per-row scale S[n] applied in the epilogue
+ *   B_KN    : B is FP32 [K, N] (row k contiguous, V of attention)
+ * Epilogue order: *alpha, *scale[n], +bias[n], GELU(tanh), +C (residual).
+ * Batch z = zo * zdiv + zi selects base offsets  off + zo * s1 + zi * s2  for A, B and C.
+ * Offsets/strides of B count elements of B's type (bytes for INT8).
+ */
+#extension GL_EXT_control_flow_attributes : enable
+
+#ifndef BM
+#define BM 64
+#endif
+#ifndef BN
+#define BN 64
+#endif
+#ifndef BK
+#define BK 16
+#endif
+#ifndef TM
+#define TM 4
+#endif
+#ifndef TN
+#define TN 4
+#endif
+#define RM (BM / TM)          /* threads along M */
+#define RN (BN / TN)          /* threads along N */
+#define WG (RM * RN)
+#if (BM * BK) % WG != 0 || (BN * BK) % WG != 0
+#error tile loads must divide evenly among the threads
+#endif
+
+layout(local_size_x = WG) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer BufA { float a[]; };
+layout(std430, set = 0, binding = 1) readonly buffer BufB { uint b[]; };
+layout(std430, set = 0, binding = 2) readonly buffer BufS { float sc[]; };
+layout(std430, set = 0, binding = 3) readonly buffer BufBias { float bias[]; };
+layout(std430, set = 0, binding = 4) buffer BufC { float c[]; };
+
+layout(push_constant) uniform PC {
+    uint M, N, K;
+    uint lda, ldb, ldc;
+    uint a_off, b_off, c_off;
+    uint s_off, bias_off;
+    uint flags; /* 1 bias, 2 gelu, 4 residual, 8 scales */
+    uint zdiv;
+    uint a_s1, a_s2, b_s1, b_s2, c_s1, c_s2;
+    float alpha;
+} p;
+
+shared float As[BK][BM + 1];
+shared float Bs[BK][BN + 1];
+
+float load_b(uint idx)
+{
+#if defined(B_INT8)
+    uint w = b[idx >> 2];
+    return float(bitfieldExtract(int(w), int((idx & 3u) * 8u), 8));
+#else
+    return uintBitsToFloat(b[idx]);
+#endif
+}
+
+void main()
+{
+    const uint tid = gl_LocalInvocationID.x;
+    const uint tx = tid % RN;
+    const uint ty = tid / RN;
+    const uint m0 = gl_WorkGroupID.y * BM;
+    const uint n0 = gl_WorkGroupID.x * BN;
+    const uint zo = gl_WorkGroupID.z / p.zdiv;
+    const uint zi = gl_WorkGroupID.z % p.zdiv;
+    const uint abase = p.a_off + zo * p.a_s1 + zi * p.a_s2;
+    const uint bbase = p.b_off + zo * p.b_s1 + zi * p.b_s2;
+    const uint cbase = p.c_off + zo * p.c_s1 + zi * p.c_s2;
+
+    float acc[TM][TN];
+    [[unroll]] for (int i = 0; i < TM; i++)
+        [[unroll]] for (int j = 0; j < TN; j++) acc[i][j] = 0.0;
+
+    for (uint k0 = 0; k0 < p.K; k0 += BK) {
+        [[unroll]] for (uint it = 0; it < BM * BK / WG; it++) {
+            uint e = tid + it * WG;
+            uint r = e / BK, kk = e % BK;
+            uint gm = m0 + r, gk = k0 + kk;
+            As[kk][r] = (gm < p.M && gk < p.K) ? a[abase + gm * p.lda + gk] : 0.0;
+        }
+#if defined(B_KN)
+        [[unroll]] for (uint it = 0; it < BN * BK / WG; it++) {
+            uint e = tid + it * WG;
+            uint kk = e / BN, r = e % BN;
+            uint gn = n0 + r, gk = k0 + kk;
+            Bs[kk][r] = (gn < p.N && gk < p.K) ? uintBitsToFloat(b[bbase + gk * p.ldb + gn]) : 0.0;
+        }
+#else
+        [[unroll]] for (uint it = 0; it < BN * BK / WG; it++) {
+            uint e = tid + it * WG;
+            uint r = e / BK, kk = e % BK;
+            uint gn = n0 + r, gk = k0 + kk;
+            Bs[kk][r] = (gn < p.N && gk < p.K) ? load_b(bbase + gn * p.ldb + gk) : 0.0;
+        }
+#endif
+        barrier();
+
+        [[unroll]] for (uint kk = 0; kk < BK; kk++) {
+            float av[TM], bv[TN];
+            [[unroll]] for (uint i = 0; i < TM; i++) av[i] = As[kk][ty + i * RM];
+            [[unroll]] for (uint j = 0; j < TN; j++) bv[j] = Bs[kk][tx + j * RN];
+            [[unroll]] for (uint i = 0; i < TM; i++)
+                [[unroll]] for (uint j = 0; j < TN; j++) acc[i][j] = fma(av[i], bv[j], acc[i][j]);
+        }
+        barrier();
+    }
+
+    [[unroll]] for (uint i = 0; i < TM; i++) {
+        uint gm = m0 + ty + i * RM;
+        if (gm >= p.M) continue;
+        [[unroll]] for (uint j = 0; j < TN; j++) {
+            uint gn = n0 + tx + j * RN;
+            if (gn >= p.N) continue;
+            float v = acc[i][j] * p.alpha;
+            if ((p.flags & 8u) != 0u) v *= sc[p.s_off + gn];
+            if ((p.flags & 1u) != 0u) v += bias[p.bias_off + gn];
+            if ((p.flags & 2u) != 0u) {
+                float u = 0.7978845608028654 * (v + 0.044715 * v * v * v);
+                float t = 1.0 - 2.0 / (exp(2.0 * u) + 1.0); /* tanh(u), safe for large |u| */
+                v = 0.5 * v * (1.0 + t);
+            }
+            uint ci = cbase + gm * p.ldc + gn;
+            if ((p.flags & 4u) != 0u) v += c[ci];
+            c[ci] = v;
+        }
+    }
+}
