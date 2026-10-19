@@ -95,7 +95,20 @@ static void init_dense_lut(void) {
 #include "eif_tinyllm.h"
 #include "eif_gemm.h"
 
+/* A quant type carries the ternary scale group in its upper bits: base = qt & 0xff, group = qt >> 8
+ * (0 = one scale per row, the classic BitNet layout). Set at load time from config.ternary_group. */
+#define QT_BASE(qt)  ((qt) & 0xff)
+#define QT_GROUP(qt) ((qt) >> 8)
+/* Scale floats of a [rows, cols] matrix. */
+static inline size_t scale_count(int rows, int cols, int qt) {
+    int g = QT_GROUP(qt);
+    return (size_t)rows * (g > 0 ? (size_t)(cols / g) : 1u);
+}
+/* The tiny dt/beta projections (proj_b, proj_a) of a grouped checkpoint stay FP32 (they are FP32 in the source). */
+static inline int small_qtype(int qt) { return QT_GROUP(qt) > 0 ? QWEN35_QTYPE_FP32 : qt; }
+
 static inline size_t row_bytes(int cols, int quant_type) {
+    quant_type = QT_BASE(quant_type);
     if (quant_type == QWEN35_QTYPE_BITNET_DENSE) return (size_t)(cols + 4) / 5;
     if (quant_type == QWEN35_QTYPE_INT4)         return (size_t)(cols + 1) / 2;
     if (quant_type == QWEN35_QTYPE_FP32)         return (size_t)cols * sizeof(float);
@@ -112,11 +125,19 @@ static inline size_t embed_row_bytes(int cols, int eq) {
 }
 
 /* Map embedding storage type to the weight quant type used by linear_gemv. */
-static inline int embed_to_weight_qtype(int eq) {
+static inline int embed_to_weight_qtype(int eq, int group) {
     if (eq == QWEN35_EMBED_INT4)  return QWEN35_QTYPE_INT4;
-    if (eq == QWEN35_EMBED_2BIT)  return QWEN35_QTYPE_BITNET_2BIT;
+    if (eq == QWEN35_EMBED_2BIT)  return QWEN35_QTYPE_BITNET_2BIT | (group << 8);
     if (eq == QWEN35_EMBED_DENSE) return QWEN35_QTYPE_BITNET_DENSE;
     return QWEN35_QTYPE_FP32;
+}
+
+/* Rotate n contiguous rows of `width` floats in place: x <- H_block(x * signs). */
+static void had_rows(float *X, int n, int width, const float *signs, int block) {
+    if (block <= 0) return;
+    if (n == 1) { eif_hadamard_rotate_f32(X, signs, width, block); return; }
+    #pragma omp parallel for schedule(static)
+    for (int t = 0; t < n; t++) eif_hadamard_rotate_f32(X + (size_t)t * width, signs, width, block);
 }
 
 static void bitnet_gemv_2bit(float *out, const uint8_t *W, const float *sc,
@@ -336,7 +357,11 @@ static void int8_gemv(float *out, const int8_t *W, const float *sc,
 /* Unified GEMV dispatcher */
 static void linear_gemv(float *out, const void *W, const float *sc,
                         const float *x, int rows, int cols, int quant_type) {
-    if (quant_type == QWEN35_QTYPE_BITNET_DENSE) {
+    const int group = QT_GROUP(quant_type);
+    quant_type = QT_BASE(quant_type);
+    if (quant_type == QWEN35_QTYPE_BITNET_2BIT && group > 0) {
+        eif_matmul_bitnet_block_f32((const uint8_t *)W, sc, group, x, NULL, out, rows, cols);
+    } else if (quant_type == QWEN35_QTYPE_BITNET_DENSE) {
         bitnet_gemv_dense(out, (const uint8_t *)W, sc, x, rows, cols);
     } else if (quant_type == QWEN35_QTYPE_INT4) {
         int4_gemv(out, (const uint8_t *)W, sc, x, rows, cols);
@@ -348,10 +373,18 @@ static void linear_gemv(float *out, const void *W, const float *sc,
 }
 
 /* Quantized embedding lookup (input token -> dequantized hidden row). */
-static void embed_lookup(float *out, const uint8_t *T, const float *sc,
-                         int tok, int dim, int eq) {
+static void embed_lookup_raw(float *out, const uint8_t *T, const float *sc,
+                             int tok, int dim, int eq, int group) {
     const uint8_t *row = T + (size_t)tok * embed_row_bytes(dim, eq);
     float s = sc[tok];
+    if (eq == QWEN35_EMBED_2BIT && group > 0) {
+        const float *gs = sc + (size_t)tok * (size_t)(dim / group);
+        for (int i = 0; i < dim; i++) {
+            uint8_t code = (uint8_t)((row[i >> 2] >> ((i & 3) * 2)) & 0x03u);
+            out[i] = ((code == 1u) ? 1.0f : ((code == 2u) ? -1.0f : 0.0f)) * gs[i / group];
+        }
+        return;
+    }
     if (eq == QWEN35_EMBED_INT8) {
         for (int i = 0; i < dim; i++) out[i] = (float)((const int8_t *)row)[i] * s;
     } else if (eq == QWEN35_EMBED_INT4) {
@@ -378,6 +411,16 @@ static void embed_lookup(float *out, const uint8_t *T, const float *sc,
     } else {
         const float *frow = (const float *)row;
         for (int i = 0; i < dim; i++) out[i] = frow[i];
+    }
+}
+
+/* Embedding lookup; a Hadamard-latent table stores rotated rows, restored here: h = signs * (H z). */
+static void embed_lookup(float *out, const qwen35_had_t *had, const uint8_t *T, const float *sc,
+                         int tok, int dim, int eq, int group) {
+    embed_lookup_raw(out, T, sc, tok, dim, eq, group);
+    if (had->block > 0) {
+        eif_hadamard_rotate_f32(out, NULL, dim, had->block);
+        for (int i = 0; i < dim; i++) out[i] *= had->s_dim[i];
     }
 }
 
@@ -543,7 +586,7 @@ static void deltanet_core(float *qkv_raw, float *z_buf, float *b_buf, float *a_b
 }
 
 static void deltanet_fwd(
-    float *out, const float *x,
+    float *out, float *x, const qwen35_had_t *had,
     qwen35_delta_weights_t *w,
     qwen35_delta_state_t *st,
     const qwen35_config_t *cfg,
@@ -567,14 +610,17 @@ static void deltanet_fwd(
     float *e_buf   = scratch + conv_dim + val_dim*2 + nv2*2;  /* [vd] */
 
     /* Projections */
+    /* proj_b / proj_a are FP32 and read the unrotated input; the rotation is then applied in place for qkv / z */
+    linear_gemv(b_buf,   w->proj_b, w->b_s,   x, nv2, dim,      small_qtype(cfg->quant_lm));
+    linear_gemv(a_buf,   w->proj_a, w->a_s,   x, nv2, dim,      small_qtype(cfg->quant_lm));
+    had_rows(x, 1, dim, had->s_dim, had->block);
     linear_gemv(qkv_raw, w->qkv,    w->qkv_s, x, conv_dim, dim, cfg->quant_lm);
     linear_gemv(z_buf,   w->z,      w->z_s,   x, val_dim,  dim, cfg->quant_lm);
-    linear_gemv(b_buf,   w->proj_b, w->b_s,   x, nv2, dim,      cfg->quant_lm);
-    linear_gemv(a_buf,   w->proj_a, w->a_s,   x, nv2, dim,      cfg->quant_lm);
 
     deltanet_core(qkv_raw, z_buf, b_buf, a_buf, o_buf, e_buf, w, st, cfg);
 
     /* Output projection */
+    had_rows(o_buf, 1, val_dim, had->s_dim, had->block);
     linear_gemv(out, w->out, w->out_s, o_buf, dim, val_dim, cfg->quant_lm);
 }
 
@@ -677,7 +723,7 @@ static void fullatt_attend(const float *q_buf, const float *gate_buf, float *o_i
  * Full Attention forward (GQA + partial RoPE + output gate)
  * ============================================================ */
 static void fullatt_fwd(
-    float *out, const float *x,
+    float *out, float *x, const qwen35_had_t *had,
     qwen35_attn_weights_t *w,
     qwen35_attn_state_t *st,
     int pos, const qwen35_config_t *cfg,
@@ -695,12 +741,14 @@ static void fullatt_fwd(
      * project into `out` at the end. */
     float *attn_out  = (float *)alloca(q_dim * sizeof(float));
 
+    had_rows(x, 1, dim, had->s_dim, had->block);
     linear_gemv(qg_buf, w->q, w->q_s, x, qg_dim,  dim, cfg->quant_lm);
     linear_gemv(k_buf,  w->k, w->k_s, x, kv_dim,  dim, cfg->quant_lm);
     linear_gemv(v_buf,  w->v, w->v_s, x, kv_dim,  dim, cfg->quant_lm);
 
     fullatt_prep(qg_buf, k_buf, v_buf, q_buf, gate_buf, w, st, pos, cfg);
     fullatt_attend(q_buf, gate_buf, q_buf, attn_out, att_buf, st, w->sub_norm, pos, cfg);
+    had_rows(q_buf, 1, q_dim, had->s_dim, had->block);
     linear_gemv(out, w->o, w->o_s, q_buf, dim, q_dim, cfg->quant_lm);
 }
 
@@ -723,10 +771,11 @@ static void ffn_act(float *hb, const float *hb2, const float *sub_norm, int h_di
     }
 }
 
-static void ffn_swiglu(float *out, const float *x,
+static void ffn_swiglu(float *out, float *x, const qwen35_had_t *had,
                        qwen35_ffn_weights_t *w,
                        float *hb, float *hb2, int dim, int h_dim, int quant_type, int plain) {
-    if (quant_type == QWEN35_QTYPE_BITNET_2BIT) {
+    had_rows(x, 1, dim, had->s_dim, had->block);
+    if (quant_type == QWEN35_QTYPE_BITNET_2BIT) { /* group == 0 only: grouped types differ in the upper bits */
         /* Fused gate+up in a single OpenMP region (same kernel, one fork/join). */
         eif_matmul_bitnet_f32_w1w3(hb, hb2, w->gate, w->up, w->gate_s, w->up_s,
                                    x, h_dim, dim);
@@ -736,6 +785,7 @@ static void ffn_swiglu(float *out, const float *x,
     }
 
     ffn_act(hb, hb2, w->sub_norm, h_dim, plain);
+    had_rows(hb, 1, h_dim, had->s_hid, had->block);
     linear_gemv(out, w->down, w->down_s, hb, dim, h_dim, quant_type);
 }
 
@@ -763,20 +813,20 @@ float *qwen35_forward_ex(qwen35_t *m, int tok, int pos, bool compute_logits) {
     if (pos < 0 || pos >= cfg->max_seq_len) return NULL;
 
     /* 1. Embed */
-    embed_lookup(s->x, (const uint8_t *)w->embed, w->embed_s, tok, dim, cfg->quant_embed);
+    embed_lookup(s->x, &w->had, (const uint8_t *)w->embed, w->embed_s, tok, dim, cfg->quant_embed, cfg->ternary_group);
 
     int dn_idx = 0, fa_idx = 0;
     for (int l = 0; l < n_lay; l++) {
         rmsnorm(s->xb, s->x, w->rms_att[l], dim);
 
         if (m->layer_types[l] == QWEN35_LAYER_DELTANET) {
-            deltanet_fwd(s->xb2, s->xb,
+            deltanet_fwd(s->xb2, s->xb, &w->had,
                          &w->delta[dn_idx], &s->delta[dn_idx], cfg, dn_scratch);
             dn_idx++;
         } else {
             /* use xb2 as output scratch, xb stays as input */
             memset(s->xb2, 0, dim * sizeof(float));
-            fullatt_fwd(s->xb2, s->xb,
+            fullatt_fwd(s->xb2, s->xb, &w->had,
                         &w->full[fa_idx], &s->attn[fa_idx],
                         pos, cfg, s->q, s->k, s->v, s->att);
             fa_idx++;
@@ -785,7 +835,7 @@ float *qwen35_forward_ex(qwen35_t *m, int tok, int pos, bool compute_logits) {
         for (int i = 0; i < dim; i++) s->x[i] += s->xb2[i];
 
         rmsnorm(s->xb, s->x, w->rms_ffn[l], dim);
-        ffn_swiglu(s->xb2, s->xb, &w->ffn[l], s->hb, s->hb2, dim, cfg->hidden_dim, cfg->quant_lm, cfg->plain_linear);
+        ffn_swiglu(s->xb2, s->xb, &w->had, &w->ffn[l], s->hb, s->hb2, dim, cfg->hidden_dim, cfg->quant_lm, cfg->plain_linear);
         for (int i = 0; i < dim; i++) s->x[i] += s->xb2[i];
     }
 
@@ -804,8 +854,9 @@ float *qwen35_forward_ex(qwen35_t *m, int tok, int pos, bool compute_logits) {
     if (cfg->quant_embed == QWEN35_EMBED_INT8) {
         int8_gemv(s->logits, (const int8_t *)E, Es, s->xb, vocab, dim);
     } else {
+        had_rows(s->xb, 1, dim, w->had.s_dim, w->had.block);
         linear_gemv(s->logits, E, Es, s->xb, vocab, dim,
-                    embed_to_weight_qtype(cfg->quant_embed));
+                    embed_to_weight_qtype(cfg->quant_embed, cfg->ternary_group));
     }
 
     s->pos = pos + 1;
@@ -851,19 +902,19 @@ void qwen35_inject_visual(qwen35_t *m, const float *embs, int n_tok, int start_p
         for (int l = 0; l < cfg->n_layers; l++) {
             rmsnorm(s->xb, s->x, m->weights.rms_att[l], dim);
             if (m->layer_types[l] == QWEN35_LAYER_DELTANET) {
-                deltanet_fwd(s->xb2, s->xb,
+                deltanet_fwd(s->xb2, s->xb, &m->weights.had,
                              &m->weights.delta[dn_idx], &s->delta[dn_idx], cfg, dn_scratch);
                 dn_idx++;
             } else {
                 memset(s->xb2, 0, dim * sizeof(float));
-                fullatt_fwd(s->xb2, s->xb,
+                fullatt_fwd(s->xb2, s->xb, &m->weights.had,
                             &m->weights.full[fa_idx], &s->attn[fa_idx],
                             start_pos + t, cfg, s->q, s->k, s->v, s->att);
                 fa_idx++;
             }
             for (int i = 0; i < dim; i++) s->x[i] += s->xb2[i];
             rmsnorm(s->xb, s->x, m->weights.rms_ffn[l], dim);
-            ffn_swiglu(s->xb2, s->xb, &m->weights.ffn[l], s->hb, s->hb2, dim, cfg->hidden_dim, cfg->quant_lm, cfg->plain_linear);
+            ffn_swiglu(s->xb2, s->xb, &m->weights.had, &m->weights.ffn[l], s->hb, s->hb2, dim, cfg->hidden_dim, cfg->quant_lm, cfg->plain_linear);
             for (int i = 0; i < dim; i++) s->x[i] += s->xb2[i];
         }
     }
@@ -886,7 +937,14 @@ static void dequant_row(float *dst, const void *W, const float *sc, int r, int c
         memcpy(dst, row, (size_t)cols * sizeof(float));
         return;
     }
-    float s = sc[r];
+    const int group = QT_GROUP(qt);
+    qt = QT_BASE(qt);
+    float s = group > 0 ? 1.0f : sc[r];
+    if (qt == QWEN35_QTYPE_BITNET_2BIT && group > 0) {
+        const float *gs = sc + (size_t)r * (size_t)(cols / group);
+        for (int c = 0; c < cols; c++) dst[c] = (float)eif_unpack_ternary(row[c >> 2], c & 3) * gs[c / group];
+        return;
+    }
     if (qt == QWEN35_QTYPE_BITNET_DENSE) {
         init_dense_lut();
         for (int c = 0, b = 0; c < cols; b++)
@@ -968,19 +1026,22 @@ static int prefill_chunk(qwen35_t *m, const float *emb, int n, int start_pos)
         if (m->layer_types[l] == QWEN35_LAYER_DELTANET) {
             qwen35_delta_weights_t *dw = &w->delta[dn];
             float *B = P3, *A = P3 + (size_t)n * nv2;
+            linear_gemm(B, dw->proj_b, dw->b_s, XB, n, nv2, dim, small_qtype(qt));
+            linear_gemm(A, dw->proj_a, dw->a_s, XB, n, nv2, dim, small_qtype(qt));
+            had_rows(XB, n, dim, w->had.s_dim, w->had.block);
             linear_gemm(P0, dw->qkv, dw->qkv_s, XB, n, conv_dim, dim, qt);
             linear_gemm(P1, dw->z, dw->z_s, XB, n, val_dim, dim, qt);
-            linear_gemm(B, dw->proj_b, dw->b_s, XB, n, nv2, dim, qt);
-            linear_gemm(A, dw->proj_a, dw->a_s, XB, n, nv2, dim, qt);
             for (int t = 0; t < n; t++)
                 deltanet_core(P0 + (size_t)t * conv_dim, P1 + (size_t)t * val_dim, B + (size_t)t * nv2,
                               A + (size_t)t * nv2, P2 + (size_t)t * val_dim, E, dw, &s->delta[dn], cfg);
+            had_rows(P2, n, val_dim, w->had.s_dim, w->had.block);
             linear_gemm(OUT, dw->out, dw->out_s, P2, n, dim, val_dim, qt);
             dn++;
         } else {
             qwen35_attn_weights_t *aw = &w->full[fa];
             qwen35_attn_state_t *as = &s->attn[fa];
             float *K = P3, *V = P3 + (size_t)n * kv_dim, *Q = P2, *G = P2 + (size_t)n * q_dim;
+            had_rows(XB, n, dim, w->had.s_dim, w->had.block);
             linear_gemm(P0, aw->q, aw->q_s, XB, n, 2 * q_dim, dim, qt);
             linear_gemm(K, aw->k, aw->k_s, XB, n, kv_dim, dim, qt);
             linear_gemm(V, aw->v, aw->v_s, XB, n, kv_dim, dim, qt);
@@ -1000,16 +1061,19 @@ static int prefill_chunk(qwen35_t *m, const float *emb, int n, int start_pos)
                 free(att);
                 free(ao);
             }
+            had_rows(P0, n, q_dim, w->had.s_dim, w->had.block);
             linear_gemm(OUT, aw->o, aw->o_s, P0, n, dim, q_dim, qt);
             fa++;
         }
         for (size_t i = 0; i < (size_t)n * dim; i++) X[i] += OUT[i];
 
         for (int t = 0; t < n; t++) rmsnorm(XB + (size_t)t * dim, X + (size_t)t * dim, w->rms_ffn[l], dim);
+        had_rows(XB, n, dim, w->had.s_dim, w->had.block);
         linear_gemm(P0, w->ffn[l].gate, w->ffn[l].gate_s, XB, n, hidden, dim, qt);
         linear_gemm(P1, w->ffn[l].up, w->ffn[l].up_s, XB, n, hidden, dim, qt);
         for (int t = 0; t < n; t++)
             ffn_act(P0 + (size_t)t * hidden, P1 + (size_t)t * hidden, w->ffn[l].sub_norm, hidden, cfg->plain_linear);
+        had_rows(P0, n, hidden, w->had.s_hid, w->had.block);
         linear_gemm(OUT, w->ffn[l].down, w->ffn[l].down_s, P0, n, dim, hidden, qt);
         for (size_t i = 0; i < (size_t)n * dim; i++) X[i] += OUT[i];
     }
@@ -1035,7 +1099,8 @@ float *qwen35_prefill_embeds(qwen35_t *m, const float *embs, int n_tok, int star
     if (cfg->quant_embed == QWEN35_EMBED_INT8) {
         int8_gemv(s->logits, (const int8_t *)E, w->embed_s, s->xb, cfg->vocab_size, cfg->dim);
     } else {
-        linear_gemv(s->logits, E, w->embed_s, s->xb, cfg->vocab_size, cfg->dim, embed_to_weight_qtype(cfg->quant_embed));
+        had_rows(s->xb, 1, cfg->dim, w->had.s_dim, w->had.block);
+        linear_gemv(s->logits, E, w->embed_s, s->xb, cfg->vocab_size, cfg->dim, embed_to_weight_qtype(cfg->quant_embed, cfg->ternary_group));
     }
     return s->logits;
 }
@@ -1047,8 +1112,8 @@ float *qwen35_prefill(qwen35_t *m, const int *toks, int n_tok, int start_pos, bo
     float *embs = (float *)malloc(sizeof(float) * (size_t)n_tok * cfg->dim);
     if (!embs) return NULL;
     for (int t = 0; t < n_tok; t++)
-        embed_lookup(embs + (size_t)t * cfg->dim, (const uint8_t *)m->weights.embed, m->weights.embed_s, toks[t],
-                     cfg->dim, cfg->quant_embed);
+        embed_lookup(embs + (size_t)t * cfg->dim, &m->weights.had, (const uint8_t *)m->weights.embed, m->weights.embed_s, toks[t],
+                     cfg->dim, cfg->quant_embed, cfg->ternary_group);
     float *r = qwen35_prefill_embeds(m, embs, n_tok, start_pos, compute_logits);
     free(embs);
     return r;
@@ -1109,6 +1174,29 @@ int qwen35_load(qwen35_t *m, const char *path, void *state_mem, size_t state_sz)
     const uint8_t *lt = base + hdr->config_offset + 128;
     memcpy(m->layer_types, lt, m->config.n_layers);
 
+    /* Grouped ternary scales ride in the upper bits of quant_lm (see QT_BASE / QT_GROUP). */
+    if (m->config.ternary_group != 0) {
+        const qwen35_config_t *c = &m->config;
+        int g = c->ternary_group;
+        int q_dim = c->n_heads * c->head_dim, val_dim = c->lin_n_v_heads * c->lin_v_head_dim;
+        if (g < 32 || g > 4096 || g % 32 != 0 || c->quant_lm != QWEN35_QTYPE_BITNET_2BIT ||
+            (c->quant_embed != QWEN35_EMBED_2BIT && c->quant_embed != QWEN35_EMBED_INT8) ||
+            c->dim <= 0 || c->hidden_dim <= 0 || c->dim % g || c->hidden_dim % g || q_dim % g || val_dim % g) {
+            fprintf(stderr, "qwen35_load: invalid ternary_group %d\n", g);
+            return -5;
+        }
+        m->config.quant_lm |= g << 8;
+    }
+    if (m->config.hadamard_block != 0) {
+        const qwen35_config_t *c = &m->config;
+        int b = c->hadamard_block;
+        if (c->ternary_group <= 0 || b < 2 || (b & (b - 1)) != 0 || c->dim % b || c->hidden_dim % b ||
+            c->n_heads * c->head_dim != c->dim || c->lin_n_v_heads * c->lin_v_head_dim != c->dim ||
+            c->quant_embed != QWEN35_EMBED_2BIT) {
+            fprintf(stderr, "qwen35_load: invalid hadamard_block %d\n", b);
+            return -5;
+        }
+    }
     const qwen35_config_t *cfg = &m->config;
     qwen35_weights_t *W = &m->weights;
 
@@ -1158,8 +1246,9 @@ int qwen35_load(qwen35_t *m, const char *path, void *state_mem, size_t state_sz)
     const uint8_t *dn_qkv = wp; wp += (size_t)n_dn * PSZ(conv_dim, dim);
     const uint8_t *dn_z   = wp; wp += (size_t)n_dn * PSZ(val_dim,  dim);
     const uint8_t *dn_out = wp; wp += (size_t)n_dn * PSZ(dim, val_dim);
-    const uint8_t *dn_pb  = wp; wp += (size_t)n_dn * PSZ(nv, dim);
-    const uint8_t *dn_pa  = wp; wp += (size_t)n_dn * PSZ(nv, dim);
+    const int small_qt = small_qtype(cfg->quant_lm);
+    const uint8_t *dn_pb  = wp; wp += (size_t)n_dn * row_bytes(dim, small_qt) * (size_t)nv;
+    const uint8_t *dn_pa  = wp; wp += (size_t)n_dn * row_bytes(dim, small_qt) * (size_t)nv;
     const uint8_t *fa_q   = wp; wp += (size_t)n_fa * PSZ(qg_dim, dim);
     const uint8_t *fa_k   = wp; wp += (size_t)n_fa * PSZ(kv_dim, dim);
     const uint8_t *fa_v   = wp; wp += (size_t)n_fa * PSZ(kv_dim, dim);
@@ -1182,8 +1271,8 @@ int qwen35_load(qwen35_t *m, const char *path, void *state_mem, size_t state_sz)
             W->delta[di].qkv    = dn_qkv + (size_t)di * (row_bytes(dim, cfg->quant_lm) * (size_t)conv_dim);
             W->delta[di].z      = dn_z   + (size_t)di * (row_bytes(dim, cfg->quant_lm) * (size_t)val_dim);
             W->delta[di].out    = dn_out + (size_t)di * (row_bytes(val_dim, cfg->quant_lm) * (size_t)dim);
-            W->delta[di].proj_b = dn_pb  + (size_t)di * (row_bytes(dim, cfg->quant_lm) * (size_t)nv);
-            W->delta[di].proj_a = dn_pa  + (size_t)di * (row_bytes(dim, cfg->quant_lm) * (size_t)nv);
+            W->delta[di].proj_b = dn_pb  + (size_t)di * (row_bytes(dim, small_qt) * (size_t)nv);
+            W->delta[di].proj_a = dn_pa  + (size_t)di * (row_bytes(dim, small_qt) * (size_t)nv);
             W->delta[di].conv   = dn_cv  + (size_t)di * conv_dim * ck;
             W->delta[di].dt_bias= dn_dt  + (size_t)di * nv;
             W->delta[di].A_log  = dn_al  + (size_t)di * nv;
@@ -1200,24 +1289,27 @@ int qwen35_load(qwen35_t *m, const char *path, void *state_mem, size_t state_sz)
 
     /* Scales */
     const float *sc = (const float *)(base + hdr->scales_offset);
-    W->embed_s = sc; sc += vocab;
+    const int lq = cfg->quant_lm, gq = cfg->ternary_group;
+    W->embed_s = sc;
+    sc += (cfg->quant_embed == QWEN35_EMBED_2BIT && gq > 0) ? scale_count(vocab, dim, QWEN35_QTYPE_BITNET_2BIT | (gq << 8))
+                                                             : (size_t)vocab;
     for (int i = 0; i < n_dn; i++) {
-        W->delta[i].qkv_s = sc; sc += conv_dim;
-        W->delta[i].z_s   = sc; sc += val_dim;
-        W->delta[i].out_s = sc; sc += dim;
-        W->delta[i].b_s   = sc; sc += nv;
-        W->delta[i].a_s   = sc; sc += nv;
+        W->delta[i].qkv_s = sc; sc += scale_count(conv_dim, dim, lq);
+        W->delta[i].z_s   = sc; sc += scale_count(val_dim, dim, lq);
+        W->delta[i].out_s = sc; sc += scale_count(dim, val_dim, lq);
+        if (gq > 0) { W->delta[i].b_s = NULL; W->delta[i].a_s = NULL; } /* FP32, unscaled */
+        else { W->delta[i].b_s = sc; sc += nv; W->delta[i].a_s = sc; sc += nv; }
     }
     for (int i = 0; i < n_fa; i++) {
-        W->full[i].q_s    = sc; sc += qg_dim;
-        W->full[i].k_s    = sc; sc += kv_dim;
-        W->full[i].v_s    = sc; sc += kv_dim;
-        W->full[i].o_s    = sc; sc += dim;
+        W->full[i].q_s    = sc; sc += scale_count(qg_dim, dim, lq);
+        W->full[i].k_s    = sc; sc += scale_count(kv_dim, dim, lq);
+        W->full[i].v_s    = sc; sc += scale_count(kv_dim, dim, lq);
+        W->full[i].o_s    = sc; sc += scale_count(dim, q_dim, lq);
     }
     for (int l = 0; l < 24; l++) {
-        W->ffn[l].gate_s  = sc; sc += hidden;
-        W->ffn[l].up_s    = sc; sc += hidden;
-        W->ffn[l].down_s  = sc; sc += dim;
+        W->ffn[l].gate_s  = sc; sc += scale_count(hidden, dim, lq);
+        W->ffn[l].up_s    = sc; sc += scale_count(hidden, dim, lq);
+        W->ffn[l].down_s  = sc; sc += scale_count(dim, hidden, lq);
     }
 
     /* Norms */
@@ -1234,6 +1326,16 @@ int qwen35_load(qwen35_t *m, const char *path, void *state_mem, size_t state_sz)
             W->full[fi].q_norm = np; np += hd;
             W->full[fi].k_norm = np; np += hd; fi++;
         }
+    }
+
+    /* Hadamard sign vectors follow the QK norms (+-1 floats, width dim then hidden_dim) */
+    W->had.block = cfg->hadamard_block;
+    W->had.s_dim = W->had.s_hid = NULL;
+    if (cfg->hadamard_block > 0) {
+        const float *nend = (const float *)(base + hdr->norms_offset + hdr->norms_size);
+        if (np + dim + hidden > nend) { fprintf(stderr, "qwen35_load: Hadamard signs missing\n"); return -4; }
+        W->had.s_dim = np; np += dim;
+        W->had.s_hid = np; np += hidden;
     }
 
     /* SubLN scales (if serialized in norms buffer) */

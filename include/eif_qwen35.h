@@ -98,7 +98,15 @@ typedef struct {
     int32_t quant_vision;    /* 0=FP32, 1=INT4, 2=BitNet 2-bit, 3=BitNet Dense 1.60b */
     int32_t quant_embed;     /* QWEN35_EMBED_* for embed_tokens / tied LM head */
     int32_t plain_linear;    /* 1 = plain (non-BitNet) linears: no SubLN RMSNorm before o_proj / down_proj */
-    int32_t _pad[5];         /* zero-padded to 128 bytes */
+    int32_t ternary_group;   /* >0: ternary linears (and a 2-bit embedding) carry one scale per `ternary_group` input
+                              * weights ([rows, cols/group] floats) instead of one per row; proj_b/proj_a are then FP32.
+                              * 0 = per-row scales (all earlier files). Multiple of 32 dividing every input width. */
+    int32_t hadamard_block;  /* >0: every ternary linear (and the tied head) expects its input rotated by a signed blockwise
+                              * Walsh-Hadamard transform of this block size (x <- H(x * signs)); the embedding table holds
+                              * rotated rows (row <- H(row) * signs after lookup). Needs ternary_group > 0. The sign
+                              * vectors (width dim, then width hidden_dim, +-1 floats) follow the QK norms in the norms
+                              * buffer. 0 = no rotation. */
+    int32_t _pad[3];         /* zero-padded to 128 bytes */
 } qwen35_config_t;
 
 // =============================================================================
@@ -158,8 +166,16 @@ typedef struct {
     const float   *sub_norm;    /* [hidden_dim] SubLN scale before down_proj */
 } qwen35_ffn_weights_t;
 
+/** Hadamard rotation parameters (hadamard_block == 0: disabled) */
+typedef struct {
+    int block;
+    const float *s_dim;         /* [dim] signs for inputs of width dim (= n_heads*head_dim = value dim) */
+    const float *s_hid;         /* [hidden_dim] signs for the down_proj input */
+} qwen35_had_t;
+
 /** All model weights */
 typedef struct {
+    qwen35_had_t had;
     /* Token embeddings: INT8 [vocab_size, dim] */
     const int8_t  *embed;
     const float   *embed_s;     /* [vocab_size] per-row scales */
