@@ -734,6 +734,198 @@ static void siglip_gemm_qkv(
     }
 }
 
+/* ---------------------------------------------------------------------------------------------
+ * INT8 x INT8 -> INT32 ViT projections on Armv8.6 i8mm (SMMLA), used for INT8-exported weights.
+ * Activations are quantised per row (absmax / 127), weights keep their per-row export scales, so
+ *   C[m][n] = sa[m] * sw[n] * sum_k a8[m][k] * w8[n][k] + b[n].
+ * Both operands are packed in row pairs, 8 bytes of each row per k-step: one 16-byte vector feeds SMMLA,
+ * which adds the 2x2 block a(2x8) . b(2x8)^T. BITLLM_VIT_FP32=1 forces the FP32 path.
+ * ------------------------------------------------------------------------------------------- */
+#if defined(__aarch64__) && defined(__linux__) && defined(__GNUC__)
+#include <arm_neon.h>
+#include <sys/auxv.h>
+#ifndef HWCAP2_I8MM
+#define HWCAP2_I8MM (1 << 13)
+#endif
+#define SIGLIP_I8MM_BUILD 1
+#ifndef SIGLIP_I8_DEFAULT_MASK
+#define SIGLIP_I8_DEFAULT_MASK 0x3F /* all six; fc2 uses grouped activation scales */
+#endif
+
+/* bit m set -> projection m (q, k, v, out, fc1, fc2) runs as INT8 GEMM; BITLLM_VIT_I8_MASK overrides */
+static int siglip_i8_mask(void)
+{
+    static int mask = -1;
+    if (mask < 0) {
+        const char *e = getenv("BITLLM_VIT_I8_MASK");
+        mask = e ? (int)strtol(e, NULL, 0) : SIGLIP_I8_DEFAULT_MASK;
+    }
+    return mask;
+}
+
+int eif_siglip_int8_gemm_available(void)
+{
+    static int avail = -1;
+    if (avail < 0) {
+        const char *e = getenv("BITLLM_VIT_FP32");
+        avail = (e && e[0] == '1') ? 0 : ((getauxval(AT_HWCAP2) & HWCAP2_I8MM) ? 1 : 0);
+    }
+    return avail;
+}
+
+/* rows [M, K] -> pair-packed int8 + one scale per (row, group of G inputs): sa[m * (K / G) + g].
+ * G = K is per-row scaling; a smaller G keeps small activations resolvable next to outlier channels
+ * (the GELU output feeding fc2). */
+static void siglip_pack_a_i8(const float *A, int M, int K, int G, int8_t *Ap, float *sa)
+{
+    const int KB = K / 8, ng = K / G;
+    #pragma omp parallel for schedule(static) if(!omp_in_parallel())
+    for (int m = 0; m < M; m++) {
+        const float *a = A + (size_t)m * K;
+        int8_t *dst = Ap + (size_t)(m / 2) * KB * 16 + (m & 1) * 8;
+        for (int g = 0; g < ng; g++) {
+            float amax = 0.0f;
+            for (int k = g * G; k < (g + 1) * G; k++) { float v = fabsf(a[k]); if (v > amax) amax = v; }
+            const float s = amax > 0.0f ? amax / 127.0f : 1.0f;
+            const float inv = 1.0f / s;
+            sa[(size_t)m * ng + g] = s;
+            for (int kb = g * G / 8; kb < (g + 1) * G / 8; kb++)
+                for (int j = 0; j < 8; j++) {
+                    float q = a[kb * 8 + j] * inv;
+                    int qi = (int)(q + (q >= 0.0f ? 0.5f : -0.5f));
+                    dst[(size_t)kb * 16 + j] = (int8_t)(qi > 127 ? 127 : (qi < -127 ? -127 : qi));
+                }
+        }
+    }
+}
+
+/* int8 weight rows [N, K] (export layout) -> pair-packed */
+static void siglip_pack_w_i8(const int8_t *W, int N, int K, int8_t *Wp)
+{
+    const int KB = K / 8;
+    #pragma omp parallel for schedule(static) if(!omp_in_parallel())
+    for (int n = 0; n < N; n++) {
+        const int8_t *w = W + (size_t)n * K;
+        int8_t *dst = Wp + (size_t)(n / 2) * KB * 16 + (n & 1) * 8;
+        for (int kb = 0; kb < KB; kb++) memcpy(dst + (size_t)kb * 16, w + kb * 8, 8);
+    }
+}
+
+static inline float siglip_gelu_tanh(float v)
+{
+    const float u = 0.7978845608028654f * (v + 0.044715f * v * v * v);
+    return 0.5f * v * (1.0f + tanhf(u));
+}
+
+/* mode: 0 = store, 1 = GELU then store, 2 = add to C (residual) */
+__attribute__((target("+i8mm")))
+static void siglip_gemm_i8_packed(const int8_t *Ap, const float *sa, const int8_t *Wp, const float *sw,
+                                  const float *bias, float *C, int M, int N, int K, int G, int mode)
+{
+    const int KB = K / 8, ng = K / G, gkb = G / 8;
+    #pragma omp parallel for schedule(static) if(!omp_in_parallel())
+    for (int mb = 0; mb < M; mb += 8) {
+        const int8_t *a0 = Ap + (size_t)(mb / 2 + 0) * KB * 16;
+        const int8_t *a1 = a0 + (size_t)KB * 16;
+        const int8_t *a2 = a1 + (size_t)KB * 16;
+        const int8_t *a3 = a2 + (size_t)KB * 16;
+        for (int nb = 0; nb < N; nb += 8) {
+            const int8_t *b0 = Wp + (size_t)(nb / 2 + 0) * KB * 16;
+            const int8_t *b1 = b0 + (size_t)KB * 16;
+            const int8_t *b2 = b1 + (size_t)KB * 16;
+            const int8_t *b3 = b2 + (size_t)KB * 16;
+            /* facc[i][j] = 2x2 block (rows 2i, 2i+1 x cols 2j, 2j+1) of sum_g sa[row][g] * int32 partial sum */
+            float32x4_t facc[4][4];
+            for (int i = 0; i < 4; i++)
+                for (int j = 0; j < 4; j++) facc[i][j] = vdupq_n_f32(0.0f);
+            for (int g = 0; g < ng; g++) {
+                int32x4_t acc[4][4];
+                for (int i = 0; i < 4; i++)
+                    for (int j = 0; j < 4; j++) acc[i][j] = vdupq_n_s32(0);
+                for (int kb = g * gkb; kb < (g + 1) * gkb; kb++) {
+                    const size_t o = (size_t)kb * 16;
+                    const int8x16_t va[4] = {vld1q_s8(a0 + o), vld1q_s8(a1 + o), vld1q_s8(a2 + o), vld1q_s8(a3 + o)};
+                    const int8x16_t vb[4] = {vld1q_s8(b0 + o), vld1q_s8(b1 + o), vld1q_s8(b2 + o), vld1q_s8(b3 + o)};
+                    for (int i = 0; i < 4; i++)
+                        for (int j = 0; j < 4; j++) acc[i][j] = vmmlaq_s32(acc[i][j], va[i], vb[j]);
+                }
+                for (int i = 0; i < 4; i++) {
+                    const int r0 = mb + 2 * i;
+                    const float s0 = sa[(size_t)r0 * ng + g], s1 = sa[(size_t)(r0 + 1) * ng + g];
+                    const float sv[4] = {s0, s0, s1, s1}; /* lanes: (r0,c0) (r0,c1) (r1,c0) (r1,c1) */
+                    const float32x4_t vs = vld1q_f32(sv);
+                    for (int j = 0; j < 4; j++) facc[i][j] = vfmaq_f32(facc[i][j], vcvtq_f32_s32(acc[i][j]), vs);
+                }
+            }
+            for (int i = 0; i < 4; i++) {
+                const int r0 = mb + 2 * i, r1 = r0 + 1;
+                for (int j = 0; j < 4; j++) {
+                    const int c0 = nb + 2 * j, c1 = c0 + 1;
+                    float v[4];
+                    vst1q_f32(v, facc[i][j]);
+                    float o00 = v[0] * sw[c0] + (bias ? bias[c0] : 0.0f);
+                    float o01 = v[1] * sw[c1] + (bias ? bias[c1] : 0.0f);
+                    float o10 = v[2] * sw[c0] + (bias ? bias[c0] : 0.0f);
+                    float o11 = v[3] * sw[c1] + (bias ? bias[c1] : 0.0f);
+                    float *p0 = C + (size_t)r0 * N, *p1 = C + (size_t)r1 * N;
+                    if (mode == 1) {
+                        p0[c0] = siglip_gelu_tanh(o00); p0[c1] = siglip_gelu_tanh(o01);
+                        p1[c0] = siglip_gelu_tanh(o10); p1[c1] = siglip_gelu_tanh(o11);
+                    } else if (mode == 2) {
+                        p0[c0] += o00; p0[c1] += o01; p1[c0] += o10; p1[c1] += o11;
+                    } else {
+                        p0[c0] = o00; p0[c1] = o01; p1[c0] = o10; p1[c1] = o11;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/* one projection: weights of matrix m of layer l, A already packed */
+static void siglip_proj_i8(const eif_siglip_t *model, int l, int m, const int8_t *Ap, const float *sa, int G,
+                           const float *bias, float *C, int M, int N, int K, int mode, int8_t *wscratch)
+{
+    const eif_siglip_qmat_t *q = &model->layers[l].qm[m];
+    siglip_pack_w_i8((const int8_t *)q->codes, N, K, wscratch);
+    siglip_gemm_i8_packed(Ap, sa, wscratch, q->scales, bias, C, M, N, K, G, mode);
+}
+
+/* activation group size of the fc2 input (K = 3072); BITLLM_VIT_FC2_GROUP overrides (3072 = per row) */
+static int siglip_fc2_group(void)
+{
+    static int g = -1;
+    if (g < 0) {
+        const char *e = getenv("BITLLM_VIT_FC2_GROUP");
+        g = e ? atoi(e) : 64;
+        if (g < 8 || g % 8 != 0 || SIGLIP_INTERM_SIZE % g != 0) g = 64;
+    }
+    return g;
+}
+int eif_siglip_int8_gemm(const float *A, int M, int K, int G, const int8_t *W8, const float *sw, int N,
+                         const float *bias, float *C, int mode)
+{
+    if (!eif_siglip_int8_gemm_available()) return -1;
+    if (!A || !W8 || !sw || !C || M % 8 || N % 8 || K % 8 || G % 8 || K % G) return -2;
+    int8_t *ap = (int8_t *)malloc((size_t)M * K), *wp = (int8_t *)malloc((size_t)N * K);
+    float *sa = (float *)malloc((size_t)M * (K / G) * sizeof(float));
+    if (!ap || !wp || !sa) { free(ap); free(wp); free(sa); return -3; }
+    siglip_pack_a_i8(A, M, K, G, ap, sa);
+    siglip_pack_w_i8(W8, N, K, wp);
+    siglip_gemm_i8_packed(ap, sa, wp, sw, bias, C, M, N, K, G, mode);
+    free(ap); free(wp); free(sa);
+    return 0;
+}
+#else
+int eif_siglip_int8_gemm_available(void) { return 0; }
+int eif_siglip_int8_gemm(const float *A, int M, int K, int G, const int8_t *W8, const float *sw, int N,
+                         const float *bias, float *C, int mode)
+{
+    (void)A; (void)M; (void)K; (void)G; (void)W8; (void)sw; (void)N; (void)bias; (void)C; (void)mode;
+    return -1;
+}
+#endif
+
 int eif_siglip_encode_tile(const eif_siglip_t *model, const float *tile_pixels, float *out_tokens)
 {
     if (!model || !model->is_initialized || !tile_pixels || !out_tokens) return -1;
@@ -753,10 +945,27 @@ int eif_siglip_encode_tile(const eif_siglip_t *model, const float *tile_pixels, 
                       ? (float *)malloc((size_t)SIGLIP_INTERM_SIZE * SIGLIP_HIDDEN_SIZE * sizeof(float))
                       : NULL;
     const size_t wsq = (size_t)SIGLIP_HIDDEN_SIZE * SIGLIP_HIDDEN_SIZE;
+#ifdef SIGLIP_I8MM_BUILD
+    /* INT8 weights without Hadamard rotation can run as true INT8 GEMMs (unless a GPU takes the GEMMs) */
+    int use_i8 = model->header.qtype == EIF_SIGLIP_Q_INT8 && !model->header.reserved[1] &&
+                       !(gpu && gpu->is_available) && eif_siglip_int8_gemm_available();
+    int8_t *a8 = use_i8 ? (int8_t *)malloc((size_t)SIGLIP_NUM_PATCHES * SIGLIP_INTERM_SIZE) : NULL;
+    float *a_scale = use_i8 ? (float *)malloc((size_t)SIGLIP_NUM_PATCHES * (SIGLIP_INTERM_SIZE / 8) * sizeof(float)) : NULL;
+    int8_t *w8 = use_i8 ? (int8_t *)malloc((size_t)SIGLIP_INTERM_SIZE * SIGLIP_HIDDEN_SIZE) : NULL;
+    if (use_i8 && (!a8 || !a_scale || !w8)) {
+        free(a8); free(a_scale); free(w8);
+        a8 = NULL; a_scale = NULL; w8 = NULL;
+        use_i8 = 0;
+    }
+#define SIGLIP_I8_FREE() do { free(a8); free(a_scale); free(w8); } while (0)
+#else
+#define SIGLIP_I8_FREE() do { } while (0)
+#endif
 
     if (!x || !x_norm || !q || !k || !v || !attn_out || !mlp_h1 || !grouped ||
         (model->header.qtype != EIF_SIGLIP_Q_FP32 && !wbuf)) {
         if (wbuf) free(wbuf);
+        SIGLIP_I8_FREE();
         if (x) free(x);
         if (x_norm) free(x_norm);
         if (q) free(q);
@@ -810,6 +1019,14 @@ int eif_siglip_encode_tile(const eif_siglip_t *model, const float *tile_pixels, 
         }
 
         /* Q, K, V projections */
+#ifdef SIGLIP_I8MM_BUILD
+        if (use_i8 && (siglip_i8_mask() & 0x7) == 0x7) {
+            siglip_pack_a_i8(x_norm, SIGLIP_NUM_PATCHES, SIGLIP_HIDDEN_SIZE, SIGLIP_HIDDEN_SIZE, a8, a_scale);
+            siglip_proj_i8(model, l, 0, a8, a_scale, SIGLIP_HIDDEN_SIZE, layer->q_b, q, SIGLIP_NUM_PATCHES, SIGLIP_HIDDEN_SIZE, SIGLIP_HIDDEN_SIZE, 0, w8);
+            siglip_proj_i8(model, l, 1, a8, a_scale, SIGLIP_HIDDEN_SIZE, layer->k_b, k, SIGLIP_NUM_PATCHES, SIGLIP_HIDDEN_SIZE, SIGLIP_HIDDEN_SIZE, 0, w8);
+            siglip_proj_i8(model, l, 2, a8, a_scale, SIGLIP_HIDDEN_SIZE, layer->v_b, v, SIGLIP_NUM_PATCHES, SIGLIP_HIDDEN_SIZE, SIGLIP_HIDDEN_SIZE, 0, w8);
+        } else
+#endif
         siglip_gemm_qkv(gpu, x_norm,
                         siglip_weight(model, l, 0, wbuf), layer->q_b,
                         siglip_weight(model, l, 1, wbuf ? wbuf + wsq : NULL), layer->k_b,
@@ -988,6 +1205,12 @@ int eif_siglip_encode_tile(const eif_siglip_t *model, const float *tile_pixels, 
         }
 
         /* Out Projection + Residual Add */
+#ifdef SIGLIP_I8MM_BUILD
+        if (use_i8 && (siglip_i8_mask() & 0x8)) {
+            siglip_pack_a_i8(attn_out, SIGLIP_NUM_PATCHES, SIGLIP_HIDDEN_SIZE, SIGLIP_HIDDEN_SIZE, a8, a_scale);
+            siglip_proj_i8(model, l, 3, a8, a_scale, SIGLIP_HIDDEN_SIZE, layer->out_b, x, SIGLIP_NUM_PATCHES, SIGLIP_HIDDEN_SIZE, SIGLIP_HIDDEN_SIZE, 2, w8);
+        } else
+#endif
         siglip_gemm_f32(gpu, attn_out, siglip_weight(model, l, 3, wbuf), layer->out_b, x,
                         SIGLIP_NUM_PATCHES, SIGLIP_HIDDEN_SIZE, SIGLIP_HIDDEN_SIZE, true);
 
@@ -1001,10 +1224,22 @@ int eif_siglip_encode_tile(const eif_siglip_t *model, const float *tile_pixels, 
         }
 
         /* MLP FC1 + GELU */
+#ifdef SIGLIP_I8MM_BUILD
+        if (use_i8 && (siglip_i8_mask() & 0x10)) {
+            siglip_pack_a_i8(x_norm, SIGLIP_NUM_PATCHES, SIGLIP_HIDDEN_SIZE, SIGLIP_HIDDEN_SIZE, a8, a_scale);
+            siglip_proj_i8(model, l, 4, a8, a_scale, SIGLIP_HIDDEN_SIZE, layer->fc1_b, mlp_h1, SIGLIP_NUM_PATCHES, SIGLIP_INTERM_SIZE, SIGLIP_HIDDEN_SIZE, 1, w8);
+        } else
+#endif
         siglip_gemm_f32_gelu(gpu, x_norm, siglip_weight(model, l, 4, wbuf), layer->fc1_b, mlp_h1,
                              SIGLIP_NUM_PATCHES, SIGLIP_INTERM_SIZE, SIGLIP_HIDDEN_SIZE);
 
         /* MLP FC2 + Residual Add */
+#ifdef SIGLIP_I8MM_BUILD
+        if (use_i8 && (siglip_i8_mask() & 0x20)) {
+            siglip_pack_a_i8(mlp_h1, SIGLIP_NUM_PATCHES, SIGLIP_INTERM_SIZE, siglip_fc2_group(), a8, a_scale);
+            siglip_proj_i8(model, l, 5, a8, a_scale, siglip_fc2_group(), layer->fc2_b, x, SIGLIP_NUM_PATCHES, SIGLIP_HIDDEN_SIZE, SIGLIP_INTERM_SIZE, 2, w8);
+        } else
+#endif
         siglip_gemm_f32(gpu, mlp_h1, siglip_weight(model, l, 5, wbuf), layer->fc2_b, x,
                         SIGLIP_NUM_PATCHES, SIGLIP_HIDDEN_SIZE, SIGLIP_INTERM_SIZE, true);
     }
@@ -1050,6 +1285,7 @@ int eif_siglip_encode_tile(const eif_siglip_t *model, const float *tile_pixels, 
     free(mlp_h1);
     free(grouped);
     if (wbuf) free(wbuf);
+    SIGLIP_I8_FREE();
 
     return 0;
 }
