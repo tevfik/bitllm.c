@@ -53,6 +53,7 @@ set(BITLLM_SOURCES
     src/eif_bert.c
     src/eif_gpu.c
     src/eif_siglip.c
+    src/eif_siglip_gpu.c
 )
 
 # 1. Static Library (libbitllm.a)
@@ -201,8 +202,8 @@ if(OpenMP_C_FOUND)
     target_link_libraries(test_siglip_quant PRIVATE OpenMP::OpenMP_C)
 endif()
 
-# 11. Vulkan backend: GEMM kernels vs CPU (SKIP without a Vulkan device)
-foreach(_t test_gpu_gemm)
+# 11. Vulkan backend: GEMM kernels and the SigLIP encoder vs CPU (SKIP without a Vulkan device)
+foreach(_t test_gpu_gemm test_siglip_gpu)
     add_executable(${_t} tests/${_t}.c)
     target_link_libraries(${_t} PRIVATE bitllm_static)
     if(UNIX)
@@ -215,6 +216,7 @@ endforeach()
 
 enable_testing()
 add_test(NAME test_gpu_gemm COMMAND test_gpu_gemm)
+add_test(NAME test_siglip_gpu COMMAND test_siglip_gpu)
 add_test(NAME test_siglip_quant COMMAND test_siglip_quant)
 add_test(NAME test_siglip_tiling COMMAND test_siglip_tiling)
 add_test(NAME test_loop_guard COMMAND test_loop_guard)
