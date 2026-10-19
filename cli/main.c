@@ -16,6 +16,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 #include <string.h>
 #include <time.h>
 #ifdef _OPENMP
@@ -57,6 +58,48 @@ static void print_usage(const char *prog)
     printf("  %s artifacts/granite_docling/granite_docling_bitnet_dense.eifm --image page.png\n\n", prog);
 }
 
+#if defined(_OPENMP) && defined(__linux__)
+/* On big.LITTLE CPUs (e.g. Cortex-X925 + A725) statically scheduled GEMVs wait for the slowest core:
+ * default to the fastest cores only. Returns their count (0 = homogeneous or unknown). */
+static int pin_to_fastest_cores(void)
+{
+    enum { MAX_CPUS = 1024 };
+    static long cap[MAX_CPUS];
+    long best = 0;
+    int n = 0;
+    for (int c = 0; c < MAX_CPUS; c++) {
+        char path[96];
+        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpu_capacity", c);
+        FILE *f = fopen(path, "r");
+        if (!f) {
+            snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", c);
+            f = fopen(path, "r");
+        }
+        cap[c] = -1;
+        if (f) {
+            if (fscanf(f, "%ld", &cap[c]) != 1) cap[c] = -1;
+            fclose(f);
+        }
+        if (cap[c] > best) best = cap[c];
+        if (cap[c] >= 0) n = c + 1;
+    }
+    char places[4096] = "";
+    int n_fast = 0, n_slow = 0;
+    size_t len = 0;
+    for (int c = 0; c < n; c++) {
+        if (cap[c] < 0) continue;
+        if (cap[c] * 10 < best * 9) { n_slow++; continue; } /* same core type can differ by a few % */
+        int w = snprintf(places + len, sizeof(places) - len, "%s{%d}", n_fast ? "," : "", c);
+        if (w < 0 || (size_t)w >= sizeof(places) - len) return 0;
+        len += (size_t)w;
+        n_fast++;
+    }
+    if (n_fast == 0 || n_slow == 0) return 0;
+    setenv("OMP_PLACES", places, 0);
+    return n_fast;
+}
+#endif
+
 int main(int argc, char **argv)
 {
     if (argc < 2 || strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
@@ -65,12 +108,27 @@ int main(int argc, char **argv)
     }
 
 #ifdef _OPENMP
-    setenv("OMP_WAIT_POLICY", "ACTIVE", 0);
-    setenv("OMP_PROC_BIND", "close", 0);
-    setenv("GOMP_SPINCOUNT", "100000", 0);
-    if (!getenv("OMP_NUM_THREADS")) {
-        int procs = omp_get_num_procs();
-        omp_set_num_threads(procs >= 8 ? 8 : procs);
+    /* libgomp reads OMP_* when the library is initialised, before main(): set the defaults, then re-exec once
+     * so they take effect (spinning workers matter for the many small decode GEMVs). */
+    if (!getenv("BITLLM_OMP_ENV")) {
+        setenv("BITLLM_OMP_ENV", "1", 1);
+        setenv("OMP_WAIT_POLICY", "ACTIVE", 0);
+        setenv("OMP_PROC_BIND", "close", 0);
+        setenv("GOMP_SPINCOUNT", "100000", 0);
+        int n_fast = 0;
+#if defined(__linux__)
+        if (!getenv("OMP_PLACES") && !getenv("GOMP_CPU_AFFINITY")) n_fast = pin_to_fastest_cores();
+#endif
+        if (!getenv("OMP_NUM_THREADS")) {
+            int procs = omp_get_num_procs();
+            char nt[16];
+            snprintf(nt, sizeof(nt), "%d", n_fast > 0 ? n_fast : (procs >= 8 ? 8 : procs));
+            setenv("OMP_NUM_THREADS", nt, 1);
+        }
+#if defined(__linux__)
+        execv("/proc/self/exe", argv); /* only returns on failure: continue with the current settings */
+#endif
+        omp_set_num_threads(atoi(getenv("OMP_NUM_THREADS")));
     }
 #endif
 
