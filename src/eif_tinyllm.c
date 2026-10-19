@@ -1702,8 +1702,88 @@ void tinyllm_matmul_int8_rowscale(float *y, const int8_t *w, const float *x, int
 }
 #elif (defined(__ARM_NEON) || defined(__aarch64__))
 #include <arm_neon.h>
+#if defined(__aarch64__) && defined(__linux__)
+#include <sys/auxv.h>
+#ifndef HWCAP_ASIMDDP
+#define HWCAP_ASIMDDP (1 << 20)
+#endif
+#define TL_I8_BLK 32
+
+static int tl_has_dotprod(void)
+{
+    static int cached = -1;
+    if (cached < 0) cached = ((getauxval(AT_HWCAP) & HWCAP_ASIMDDP) && !getenv("BITLLM_INT8_F32")) ? 1 : 0;
+    return cached;
+}
+
+/* W8A8 GEMV: x is quantised to INT8 with one scale per 32 inputs (Q8_0-style), each block is reduced with
+ * SDOT and accumulated in FP32. Requires cols % 32 == 0. */
+__attribute__((target("+dotprod")))
+static void tl_int8_rowscale_dot(float *y, const int8_t *w, const float *x, int cols, int rows, const float *scales)
+{
+    int nb = cols / TL_I8_BLK;
+    int8_t xq[cols] __attribute__((aligned(16)));
+    float xs[nb];
+    for (int b = 0; b < nb; b++) {
+        const float *xb = x + b * TL_I8_BLK;
+        float32x4_t m = vdupq_n_f32(0.0f);
+        for (int i = 0; i < TL_I8_BLK; i += 4) m = vmaxq_f32(m, vabsq_f32(vld1q_f32(xb + i)));
+        float amax = vmaxvq_f32(m);
+        float d = amax / 127.0f;
+        float id = (amax > 0.0f) ? 127.0f / amax : 0.0f;
+        xs[b] = d;
+        for (int i = 0; i < TL_I8_BLK; i += 8) {
+            int32x4_t q0 = vcvtnq_s32_f32(vmulq_n_f32(vld1q_f32(xb + i), id));
+            int32x4_t q1 = vcvtnq_s32_f32(vmulq_n_f32(vld1q_f32(xb + i + 4), id));
+            int16x8_t q = vcombine_s16(vqmovn_s32(q0), vqmovn_s32(q1));
+            vst1_s8(xq + b * TL_I8_BLK + i, vqmovn_s16(q));
+        }
+    }
+
+    #pragma omp parallel for schedule(static) if((int64_t)rows * cols >= 16384)
+    for (int r = 0; r < (rows & ~3); r += 4) {
+        const int8_t *w0 = w + (size_t)r * cols;
+        const int8_t *w1 = w0 + cols, *w2 = w1 + cols, *w3 = w2 + cols;
+        float32x4_t f0 = vdupq_n_f32(0.0f), f1 = f0, f2 = f0, f3 = f0;
+        for (int b = 0; b < nb; b++) {
+            int o = b * TL_I8_BLK;
+            int8x16_t xa = vld1q_s8(xq + o), xb = vld1q_s8(xq + o + 16);
+            int32x4_t i0 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), vld1q_s8(w0 + o), xa), vld1q_s8(w0 + o + 16), xb);
+            int32x4_t i1 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), vld1q_s8(w1 + o), xa), vld1q_s8(w1 + o + 16), xb);
+            int32x4_t i2 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), vld1q_s8(w2 + o), xa), vld1q_s8(w2 + o + 16), xb);
+            int32x4_t i3 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), vld1q_s8(w3 + o), xa), vld1q_s8(w3 + o + 16), xb);
+            f0 = vfmaq_n_f32(f0, vcvtq_f32_s32(i0), xs[b]);
+            f1 = vfmaq_n_f32(f1, vcvtq_f32_s32(i1), xs[b]);
+            f2 = vfmaq_n_f32(f2, vcvtq_f32_s32(i2), xs[b]);
+            f3 = vfmaq_n_f32(f3, vcvtq_f32_s32(i3), xs[b]);
+        }
+        y[r]     = vaddvq_f32(f0) * (scales ? scales[r] : 1.0f);
+        y[r + 1] = vaddvq_f32(f1) * (scales ? scales[r + 1] : 1.0f);
+        y[r + 2] = vaddvq_f32(f2) * (scales ? scales[r + 2] : 1.0f);
+        y[r + 3] = vaddvq_f32(f3) * (scales ? scales[r + 3] : 1.0f);
+    }
+    for (int r = (rows & ~3); r < rows; r++) {
+        const int8_t *wr = w + (size_t)r * cols;
+        float32x4_t f = vdupq_n_f32(0.0f);
+        for (int b = 0; b < nb; b++) {
+            int o = b * TL_I8_BLK;
+            int32x4_t i = vdotq_s32(vdotq_s32(vdupq_n_s32(0), vld1q_s8(wr + o), vld1q_s8(xq + o)),
+                                    vld1q_s8(wr + o + 16), vld1q_s8(xq + o + 16));
+            f = vfmaq_n_f32(f, vcvtq_f32_s32(i), xs[b]);
+        }
+        y[r] = vaddvq_f32(f) * (scales ? scales[r] : 1.0f);
+    }
+}
+#endif
+
 void tinyllm_matmul_int8_rowscale(float *y, const int8_t *w, const float *x, int cols, int rows, const float *scales)
 {
+#if defined(__aarch64__) && defined(__linux__)
+    if (cols % TL_I8_BLK == 0 && tl_has_dotprod()) {
+        tl_int8_rowscale_dot(y, w, x, cols, rows, scales);
+        return;
+    }
+#endif
     #pragma omp parallel for schedule(static) if((int64_t)rows * cols >= 16384)
     for (int r = 0; r < (rows & ~3); r += 4) {
         const int8_t *w0 = w + r * cols;
@@ -1714,31 +1794,29 @@ void tinyllm_matmul_int8_rowscale(float *y, const int8_t *w, const float *x, int
         float32x4_t a0 = vdupq_n_f32(0.0f), a1 = vdupq_n_f32(0.0f);
         float32x4_t a2 = vdupq_n_f32(0.0f), a3 = vdupq_n_f32(0.0f);
 
-        for (int c = 0; c <= cols - 4; c += 4) {
-            float32x4_t in = vld1q_f32(&x[c]);
-
-            int8x8_t r0 = vld1_s8(&w0[c]);
-            int8x8_t r1 = vld1_s8(&w1[c]);
-            int8x8_t r2 = vld1_s8(&w2[c]);
-            int8x8_t r3 = vld1_s8(&w3[c]);
-
-            float32x4_t f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(vmovl_s8(r0))));
-            float32x4_t f1 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(vmovl_s8(r1))));
-            float32x4_t f2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(vmovl_s8(r2))));
-            float32x4_t f3 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(vmovl_s8(r3))));
-
-            #if defined(__ARM_FEATURE_FMA) || defined(__aarch64__)
-            a0 = vfmaq_f32(a0, in, f0);
-            a1 = vfmaq_f32(a1, in, f1);
-            a2 = vfmaq_f32(a2, in, f2);
-            a3 = vfmaq_f32(a3, in, f3);
-            #else
-            a0 = vaddq_f32(a0, vmulq_f32(in, f0));
-            a1 = vaddq_f32(a1, vmulq_f32(in, f1));
-            a2 = vaddq_f32(a2, vmulq_f32(in, f2));
-            a3 = vaddq_f32(a3, vmulq_f32(in, f3));
-            #endif
+        int c = 0;
+        for (; c <= cols - 8; c += 8) {
+            float32x4_t in_lo = vld1q_f32(&x[c]), in_hi = vld1q_f32(&x[c + 4]);
+            int16x8_t r0 = vmovl_s8(vld1_s8(&w0[c]));
+            int16x8_t r1 = vmovl_s8(vld1_s8(&w1[c]));
+            int16x8_t r2 = vmovl_s8(vld1_s8(&w2[c]));
+            int16x8_t r3 = vmovl_s8(vld1_s8(&w3[c]));
+            #define I8_ACC(a, r) do { \
+                a = vmlaq_f32(a, in_lo, vcvtq_f32_s32(vmovl_s16(vget_low_s16(r)))); \
+                a = vmlaq_f32(a, in_hi, vcvtq_f32_s32(vmovl_s16(vget_high_s16(r)))); \
+            } while (0)
+            I8_ACC(a0, r0); I8_ACC(a1, r1); I8_ACC(a2, r2); I8_ACC(a3, r3);
+            #undef I8_ACC
         }
+        float t0 = 0.0f, t1 = 0.0f, t2 = 0.0f, t3 = 0.0f;
+        for (; c < cols; c++) {
+            t0 += (float)w0[c] * x[c]; t1 += (float)w1[c] * x[c];
+            t2 += (float)w2[c] * x[c]; t3 += (float)w3[c] * x[c];
+        }
+        a0 = vsetq_lane_f32(vgetq_lane_f32(a0, 0) + t0, a0, 0);
+        a1 = vsetq_lane_f32(vgetq_lane_f32(a1, 0) + t1, a1, 0);
+        a2 = vsetq_lane_f32(vgetq_lane_f32(a2, 0) + t2, a2, 0);
+        a3 = vsetq_lane_f32(vgetq_lane_f32(a3, 0) + t3, a3, 0);
 
         #if defined(__aarch64__)
         y[r]     = vaddvq_f32(a0) * (scales ? scales[r] : 1.0f);
