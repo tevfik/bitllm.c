@@ -224,6 +224,70 @@ static void int4_gemv_dot(float *out, const uint8_t *W, const float *sc, const f
         out[r] = sc[r] * vaddvq_f32(f);
     }
 }
+
+/* Grouped ternary (2-bit codes: 1 = +1, 2 = -1, one fp32 scale per `group` inputs) x Q8 activations.
+ * Activations are quantised per 64 inputs and stored planar: plane j of block b holds x[64b + 4i + j], i < 16,
+ * so the four 2-bit planes of 16 weight bytes meet them without shuffling; 4 SDOTs per 64 weights.
+ * Requires cols % group == 0 and group % 64 == 0. */
+__attribute__((target("+dotprod")))
+static void tern_g_gemv_dot(float *out, const uint8_t *W, const float *sc, const float *x,
+                            int rows, int cols, int group)
+{
+    const int nb = cols / 64, rb = cols / 4, ng = cols / group, bpg = group / 64;
+    int8_t xp[cols] __attribute__((aligned(16)));
+    float xs[nb];
+    for (int b = 0; b < nb; b++) {
+        const float *xb = x + b * 64;
+        float32x4_t m = vdupq_n_f32(0.0f);
+        for (int i = 0; i < 64; i += 4) m = vmaxq_f32(m, vabsq_f32(vld1q_f32(xb + i)));
+        float amax = vmaxvq_f32(m), id = amax > 0.0f ? 127.0f / amax : 0.0f;
+        xs[b] = amax / 127.0f;
+        for (int j = 0; j < 4; j++)
+            for (int i = 0; i < 16; i++) xp[b * 64 + j * 16 + i] = (int8_t)lrintf(xb[4 * i + j] * id);
+    }
+    static const int8_t lut_v[16] = {0, 1, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    const int8x16_t lut = vld1q_s8(lut_v);
+    const uint8x16_t m3 = vdupq_n_u8(3);
+    #pragma omp parallel for schedule(static)
+    for (int r0 = 0; r0 < (rows & ~3); r0 += 4) {
+        const uint8_t *w0 = W + (size_t)r0 * rb;
+        float32x4_t f0 = vdupq_n_f32(0.0f), f1 = f0, f2 = f0, f3 = f0;
+        for (int g = 0; g < ng; g++) {
+            const float s0 = sc[(size_t)(r0 + 0) * ng + g], s1 = sc[(size_t)(r0 + 1) * ng + g];
+            const float s2 = sc[(size_t)(r0 + 2) * ng + g], s3 = sc[(size_t)(r0 + 3) * ng + g];
+            for (int bb = 0; bb < bpg; bb++) {
+                const int b = g * bpg + bb;
+                const int8x16_t x0 = vld1q_s8(xp + b * 64), x1 = vld1q_s8(xp + b * 64 + 16);
+                const int8x16_t x2 = vld1q_s8(xp + b * 64 + 32), x3 = vld1q_s8(xp + b * 64 + 48);
+                const float xsb = xs[b];
+#define ROW(R, F, SR) { \
+                    uint8x16_t wb = vld1q_u8(w0 + (size_t)(R) * rb + b * 16); \
+                    int32x4_t a = vdotq_s32(vdupq_n_s32(0), vqtbl1q_s8(lut, vandq_u8(wb, m3)), x0); \
+                    a = vdotq_s32(a, vqtbl1q_s8(lut, vandq_u8(vshrq_n_u8(wb, 2), m3)), x1); \
+                    a = vdotq_s32(a, vqtbl1q_s8(lut, vandq_u8(vshrq_n_u8(wb, 4), m3)), x2); \
+                    a = vdotq_s32(a, vqtbl1q_s8(lut, vshrq_n_u8(wb, 6)), x3); \
+                    F = vfmaq_n_f32(F, vcvtq_f32_s32(a), (SR) * xsb); }
+                ROW(0, f0, s0) ROW(1, f1, s1) ROW(2, f2, s2) ROW(3, f3, s3)
+#undef ROW
+            }
+        }
+        out[r0 + 0] = vaddvq_f32(f0); out[r0 + 1] = vaddvq_f32(f1);
+        out[r0 + 2] = vaddvq_f32(f2); out[r0 + 3] = vaddvq_f32(f3);
+    }
+    for (int r = rows & ~3; r < rows; r++) { /* tail rows: one at a time */
+        const uint8_t *wr = W + (size_t)r * rb;
+        float32x4_t f = vdupq_n_f32(0.0f);
+        for (int b = 0; b < nb; b++) {
+            uint8x16_t wb = vld1q_u8(wr + b * 16);
+            int32x4_t a = vdotq_s32(vdupq_n_s32(0), vqtbl1q_s8(lut, vandq_u8(wb, m3)), vld1q_s8(xp + b * 64));
+            a = vdotq_s32(a, vqtbl1q_s8(lut, vandq_u8(vshrq_n_u8(wb, 2), m3)), vld1q_s8(xp + b * 64 + 16));
+            a = vdotq_s32(a, vqtbl1q_s8(lut, vandq_u8(vshrq_n_u8(wb, 4), m3)), vld1q_s8(xp + b * 64 + 32));
+            a = vdotq_s32(a, vqtbl1q_s8(lut, vshrq_n_u8(wb, 6)), vld1q_s8(xp + b * 64 + 48));
+            f = vfmaq_n_f32(f, vcvtq_f32_s32(a), sc[(size_t)r * ng + (b / bpg)] * xs[b]);
+        }
+        out[r] = vaddvq_f32(f);
+    }
+}
 #endif
 
 static void int4_gemv(float *out, const uint8_t *W, const float *sc,
@@ -360,6 +424,12 @@ static void linear_gemv(float *out, const void *W, const float *sc,
     const int group = QT_GROUP(quant_type);
     quant_type = QT_BASE(quant_type);
     if (quant_type == QWEN35_QTYPE_BITNET_2BIT && group > 0) {
+#if defined(__aarch64__) && defined(__linux__)
+        if (cols % group == 0 && group % 64 == 0 && q35_has_dotprod() && !getenv("BITLLM_INT8_F32")) {
+            tern_g_gemv_dot(out, (const uint8_t *)W, sc, x, rows, cols, group);
+            return;
+        }
+#endif
         eif_matmul_bitnet_block_f32((const uint8_t *)W, sc, group, x, NULL, out, rows, cols);
     } else if (quant_type == QWEN35_QTYPE_BITNET_DENSE) {
         bitnet_gemv_dense(out, (const uint8_t *)W, sc, x, rows, cols);
