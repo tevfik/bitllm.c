@@ -97,7 +97,8 @@ typedef struct {
     int32_t quant_lm;        /* 0=FP32, 1=INT4, 2=BitNet 2-bit, 3=BitNet Dense 1.60b */
     int32_t quant_vision;    /* 0=FP32, 1=INT4, 2=BitNet 2-bit, 3=BitNet Dense 1.60b */
     int32_t quant_embed;     /* QWEN35_EMBED_* for embed_tokens / tied LM head */
-    int32_t _pad[6];         /* zero-padded to 128 bytes */
+    int32_t plain_linear;    /* 1 = plain (non-BitNet) linears: no SubLN RMSNorm before o_proj / down_proj */
+    int32_t _pad[5];         /* zero-padded to 128 bytes */
 } qwen35_config_t;
 
 // =============================================================================

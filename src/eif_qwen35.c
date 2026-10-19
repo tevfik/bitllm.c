@@ -654,8 +654,10 @@ static void fullatt_fwd(
     float inv_rms_o = 1.0f / sqrtf(ss_o / q_dim + 1e-6f);
     if (w->sub_norm) {
         for (int i = 0; i < q_dim; i++) q_buf[i] = attn_out[i] * inv_rms_o * w->sub_norm[i];
-    } else {
+    } else if (!cfg->plain_linear) {
         for (int i = 0; i < q_dim; i++) q_buf[i] = attn_out[i] * inv_rms_o;
+    } else {
+        memcpy(q_buf, attn_out, q_dim * sizeof(float));
     }
     linear_gemv(out, w->o, w->o_s, q_buf, dim, q_dim, cfg->quant_lm);
 }
@@ -665,7 +667,7 @@ static void fullatt_fwd(
  * ============================================================ */
 static void ffn_swiglu(float *out, const float *x,
                        qwen35_ffn_weights_t *w,
-                       float *hb, float *hb2, int dim, int h_dim, int quant_type) {
+                       float *hb, float *hb2, int dim, int h_dim, int quant_type, int plain) {
     if (quant_type == QWEN35_QTYPE_BITNET_2BIT) {
         /* Fused gate+up in a single OpenMP region (same kernel, one fork/join). */
         eif_matmul_bitnet_f32_w1w3(hb, hb2, w->gate, w->up, w->gate_s, w->up_s,
@@ -683,7 +685,7 @@ static void ffn_swiglu(float *out, const float *x,
     float inv_rms_d = 1.0f / sqrtf(ss_d / h_dim + 1e-6f);
     if (w->sub_norm) {
         for (int i = 0; i < h_dim; i++) hb[i] = hb[i] * inv_rms_d * w->sub_norm[i];
-    } else {
+    } else if (!plain) {
         for (int i = 0; i < h_dim; i++) hb[i] *= inv_rms_d;
     }
 
@@ -736,7 +738,7 @@ float *qwen35_forward_ex(qwen35_t *m, int tok, int pos, bool compute_logits) {
         for (int i = 0; i < dim; i++) s->x[i] += s->xb2[i];
 
         rmsnorm(s->xb, s->x, w->rms_ffn[l], dim);
-        ffn_swiglu(s->xb2, s->xb, &w->ffn[l], s->hb, s->hb2, dim, cfg->hidden_dim, cfg->quant_lm);
+        ffn_swiglu(s->xb2, s->xb, &w->ffn[l], s->hb, s->hb2, dim, cfg->hidden_dim, cfg->quant_lm, cfg->plain_linear);
         for (int i = 0; i < dim; i++) s->x[i] += s->xb2[i];
     }
 
@@ -814,7 +816,7 @@ void qwen35_inject_visual(qwen35_t *m, const float *embs, int n_tok, int start_p
             }
             for (int i = 0; i < dim; i++) s->x[i] += s->xb2[i];
             rmsnorm(s->xb, s->x, m->weights.rms_ffn[l], dim);
-            ffn_swiglu(s->xb2, s->xb, &m->weights.ffn[l], s->hb, s->hb2, dim, cfg->hidden_dim, cfg->quant_lm);
+            ffn_swiglu(s->xb2, s->xb, &m->weights.ffn[l], s->hb, s->hb2, dim, cfg->hidden_dim, cfg->quant_lm, cfg->plain_linear);
             for (int i = 0; i < dim; i++) s->x[i] += s->xb2[i];
         }
     }
@@ -1007,6 +1009,11 @@ int qwen35_load(qwen35_t *m, const char *path, void *state_mem, size_t state_sz)
     const uint8_t *norms_end = base + hdr->norms_offset + hdr->norms_size;
     fi = 0;
     for (int l = 0; l < cfg->n_layers; l++) {
+        if (cfg->plain_linear) { /* any serialized SubLN block (all ones) is ignored */
+            if (m->layer_types[l] == QWEN35_LAYER_FULLATT) W->full[fi++].sub_norm = NULL;
+            W->ffn[l].sub_norm = NULL;
+            continue;
+        }
         if (m->layer_types[l] == QWEN35_LAYER_FULLATT) {
             if ((const uint8_t *)(np + q_dim) <= norms_end) {
                 W->full[fi].sub_norm = np; np += q_dim;
