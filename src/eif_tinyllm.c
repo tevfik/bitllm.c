@@ -544,7 +544,9 @@ float *tinyllm_forward_embedding_ex(tinyllm_t *llm, const float *embedding, int 
             }
         }
 
-        // Multi-head attention with AVX2 vectorization
+        // Multi-head attention with AVX2 vectorization. Heads are independent (own att / xb slices), so they
+        // run in parallel once the context is long enough for the KV scan to dominate a decode step.
+        #pragma omp parallel for schedule(static) if(!omp_in_parallel() && pos >= 64)
         for (int h = 0; h < p->n_heads; h++) {
             float *q = s->q + h * head_dim;
             float *att = s->att + h * p->seq_len;
