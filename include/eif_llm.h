@@ -59,7 +59,17 @@ typedef struct {
     int eos_token_id;         /**< Stop generation if this token is produced (-1 = use model default) */
     int kv_type;              /**< KV Cache: 0 = FP32, 1 = INT8 Quantized (default: 0) */
     bool use_gpu;             /**< Request GPU acceleration (auto falls back to CPU if unavailable) */
+    int loop_guard_tokens;    /**< Vision/DocTags generation stops when the last N or more tokens are one pattern
+                                   repeated >= 4 times (degenerate loop). 0 = default (64), -1 = disabled. */
 } eif_llm_gen_config_t;
+
+/**
+ * @brief Length of the periodic tail of a token sequence.
+ *
+ * Returns the longest span at the end of @p toks that is a pattern of period p (1 <= p <= @p max_period)
+ * repeated at least 4 times, or 0 if there is none. Used to stop degenerate generation loops.
+ */
+int eif_llm_repetition_span(const int32_t *toks, int n, int max_period);
 
 /** Callback function for token generation stream */
 typedef void (*eif_llm_token_callback_fn)(const char *piece, int token_id, void *user_data);
@@ -191,6 +201,33 @@ int eif_llm_sample(eif_llm_t *llm, float temperature, float top_p);
  */
 int eif_llm_generate(eif_llm_t *llm, const char *prompt, const eif_llm_gen_config_t *cfg,
                      eif_llm_token_callback_fn cb, void *user_data);
+
+/** Encoded document image: visual tokens of rows x cols tiles + 1 global tile (64 tokens each, dim 576). */
+typedef struct {
+    float *embeds;   /**< [(rows * cols + 1) * 64, 576], owned; release with eif_llm_vision_input_free() */
+    int n_tokens;
+    int rows, cols;
+} eif_llm_vision_input_t;
+
+/**
+ * @brief Run the vision encoder only (precomputed <image>.vis.bin if present, else the native SigLIP2 tower).
+ *
+ * Reads only llm->model_path, so it may run on another thread while the same @p llm generates text for a
+ * previous page (page pipelining). Each thread should set its own OpenMP team size.
+ * @return 0 on success, negative on error.
+ */
+int eif_llm_encode_vision_docling(const eif_llm_t *llm, const char *image_path, eif_llm_vision_input_t *out);
+
+/** @brief Release an eif_llm_vision_input_t filled by eif_llm_encode_vision_docling(). */
+void eif_llm_vision_input_free(eif_llm_vision_input_t *v);
+
+/**
+ * @brief Generate DocTags from already encoded visual tokens (see eif_llm_encode_vision_docling()).
+ * @return Number of generated tokens, or negative on error.
+ */
+int eif_llm_generate_vision_docling_from(eif_llm_t *llm, const eif_llm_vision_input_t *vin, const char *prompt,
+                                         const eif_llm_gen_config_t *cfg,
+                                         eif_llm_token_callback_fn cb, void *user_data);
 
 /**
  * @brief High-level multimodal vision generation for Docling.

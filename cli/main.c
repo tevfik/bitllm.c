@@ -47,6 +47,7 @@ static void print_usage(const char *prog)
     printf("  -T, --temp <float>       Sampling temperature (default: 0.7, 0.0=argmax; 0.0 with --image)\n");
     printf("  --top-p <float>          Nucleus top-p threshold (default: 0.9)\n");
     printf("  -r, --rep-penalty <val>  Repetition penalty factor (default: 1.15, 1.0=none; 1.0 with --image)\n");
+    printf("  --no-loop-guard          Do not stop DocTags generation that repeats one pattern (--image)\n");
     printf("  --gpu                    Attempt GPU compute acceleration (graceful CPU fallback)\n");
     printf("  --kv-int8                Enable INT8 quantized KV cache (75%% memory reduction)\n\n");
     printf("Examples:\n");
@@ -84,6 +85,7 @@ int main(int argc, char **argv)
     float rep_penalty = 1.15f;
     bool temp_set = false, rep_set = false; /* explicit -T / -r win over the image-mode defaults */
     bool use_gpu = false;
+    int loop_guard = 0;
     int kv_type = 0;
 
     for (int i = 1; i < argc; i++) {
@@ -105,6 +107,8 @@ int main(int argc, char **argv)
             if (i + 1 < argc) top_p = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "-r") == 0 || strcmp(argv[i], "--rep-penalty") == 0 || strcmp(argv[i], "--repetition-penalty") == 0) {
             if (i + 1 < argc) { rep_penalty = (float)atof(argv[++i]); rep_set = true; }
+        } else if (strcmp(argv[i], "--no-loop-guard") == 0) {
+            loop_guard = -1;
         } else if (strcmp(argv[i], "--gpu") == 0) {
             use_gpu = true;
         } else if (strcmp(argv[i], "--kv-int8") == 0) {
@@ -263,6 +267,7 @@ int main(int argc, char **argv)
         .eos_token_id = -1,
         .kv_type = kv_type,
         .use_gpu = use_gpu,
+        .loop_guard_tokens = loop_guard,
     };
 
     /* Auto-wrap prompt depending on model architecture and multimodal modality */

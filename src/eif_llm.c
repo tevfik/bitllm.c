@@ -708,15 +708,25 @@ int eif_llm_generate(eif_llm_t *llm, const char *prompt, const eif_llm_gen_confi
     return generated_count;
 }
 
-int eif_llm_generate_vision_docling(eif_llm_t *llm, const char *image_path, const char *prompt,
-                                    const eif_llm_gen_config_t *cfg,
-                                    eif_llm_token_callback_fn cb, void *user_data)
+int eif_llm_repetition_span(const int32_t *toks, int n, int max_period)
 {
-    if (!llm || !llm->is_initialized || !image_path) return -1;
-    if (!llm->tokenizer_loaded) {
-        fprintf(stderr, "[EIF LLM Error] Tokenizer is required for generate()\n");
-        return -2;
+    if (!toks || n <= 0) return 0;
+    int best = 0;
+    const int scan = n < 1024 ? n : 1024; /* only the recent tail matters */
+    const int32_t *t = toks + (n - scan);
+    for (int p = 1; p <= max_period && 4 * p <= scan; p++) {
+        int run = 0; /* tokens (from the end) equal to the token one period earlier */
+        for (int i = scan - 1; i >= p && t[i] == t[i - p]; i--) run++;
+        int span = run + p;
+        if (span >= 4 * p && span > best) best = span;
     }
+    return best;
+}
+
+int eif_llm_encode_vision_docling(const eif_llm_t *llm, const char *image_path, eif_llm_vision_input_t *out)
+{
+    if (!llm || !llm->is_initialized || !image_path || !out) return -1;
+    memset(out, 0, sizeof(*out));
 
     /* 1. Try precomputed visual embeddings (.vis.bin), or encode directly via native SigLIP2 */
     float *vis_embeds = NULL;
@@ -796,6 +806,35 @@ int eif_llm_generate_vision_docling(eif_llm_t *llm, const char *image_path, cons
         return -3;
     }
 
+    out->embeds = vis_embeds;
+    out->n_tokens = num_vis_tokens;
+    out->rows = grid_rows;
+    out->cols = grid_cols;
+    return 0;
+}
+
+void eif_llm_vision_input_free(eif_llm_vision_input_t *v)
+{
+    if (!v) return;
+    free(v->embeds);
+    memset(v, 0, sizeof(*v));
+}
+
+int eif_llm_generate_vision_docling_from(eif_llm_t *llm, const eif_llm_vision_input_t *vin, const char *prompt,
+                                         const eif_llm_gen_config_t *cfg,
+                                         eif_llm_token_callback_fn cb, void *user_data)
+{
+    if (!llm || !llm->is_initialized || !vin || !vin->embeds) return -1;
+    if (!llm->tokenizer_loaded) {
+        fprintf(stderr, "[EIF LLM Error] Tokenizer is required for generate()\n");
+        return -2;
+    }
+    const float *vis_embeds = vin->embeds;
+    const int grid_rows = vin->rows, grid_cols = vin->cols;
+    if (grid_rows < 1 || grid_rows > 4 || grid_cols < 1 || grid_cols > 4 ||
+        vin->n_tokens != (grid_rows * grid_cols + 1) * 64)
+        return -3;
+
     eif_llm_gen_config_t conf;
     memset(&conf, 0, sizeof(conf));
     if (cfg) {
@@ -822,7 +861,6 @@ int eif_llm_generate_vision_docling(eif_llm_t *llm, const char *image_path, cons
     /* Assemble all prompt tokens and visual embeddings into a single batch */
     float *batch_embeddings = (float *)malloc((size_t)4096 * dim * sizeof(float));
     if (!batch_embeddings) {
-        free(vis_embeds);
         return -1;
     }
     int total_prompt_tokens = 0;
@@ -891,7 +929,6 @@ int eif_llm_generate_vision_docling(eif_llm_t *llm, const char *image_path, cons
     if (n_prompt <= 0) {
         fprintf(stderr, "[EIF LLM Error] Could not tokenize prompt '%s'\n", task_prompt);
         free(batch_embeddings);
-        free(vis_embeds);
         return -4;
     }
     n_suffix = n_prompt;
@@ -920,10 +957,12 @@ int eif_llm_generate_vision_docling(eif_llm_t *llm, const char *image_path, cons
     fflush(stderr);
 
     free(batch_embeddings);
-    free(vis_embeds);
 
     /* 5. Autoregressive generation phase with repetition penalty */
     int generated_count = 0;
+    static _Thread_local int32_t gen_tokens[8192];
+    int n_gen = 0;
+    const int loop_guard = conf.loop_guard_tokens == 0 ? 64 : conf.loop_guard_tokens;
     for (int g = 0; g < conf.max_new_tokens; g++) {
         float *logits = eif_llm_get_logits(llm);
         if (conf.repetition_penalty > 1.0f && total_history > 0 && logits) {
@@ -948,6 +987,16 @@ int eif_llm_generate_vision_docling(eif_llm_t *llm, const char *image_path, cons
             break;
         }
 
+        if (n_gen < (int)(sizeof(gen_tokens) / sizeof(gen_tokens[0]))) gen_tokens[n_gen++] = next_token;
+        if (loop_guard > 0 && n_gen >= loop_guard) {
+            int span = eif_llm_repetition_span(gen_tokens, n_gen, 64);
+            if (span >= loop_guard) {
+                fprintf(stderr, "  • Loop guard: last %d tokens repeat one pattern, stopping after %d tokens\n", span, n_gen);
+                fflush(stderr);
+                break;
+            }
+        }
+
         const char *piece = eif_bpe_tokenizer_decode(&llm->tokenizer, next_token);
         if (cb) {
             cb(piece, next_token, user_data);
@@ -963,6 +1012,23 @@ int eif_llm_generate_vision_docling(eif_llm_t *llm, const char *image_path, cons
     }
 
     return generated_count;
+}
+
+int eif_llm_generate_vision_docling(eif_llm_t *llm, const char *image_path, const char *prompt,
+                                    const eif_llm_gen_config_t *cfg,
+                                    eif_llm_token_callback_fn cb, void *user_data)
+{
+    if (!llm || !llm->is_initialized || !image_path) return -1;
+    if (!llm->tokenizer_loaded) {
+        fprintf(stderr, "[EIF LLM Error] Tokenizer is required for generate()\n");
+        return -2;
+    }
+    eif_llm_vision_input_t vin;
+    int rc = eif_llm_encode_vision_docling(llm, image_path, &vin);
+    if (rc != 0) return rc;
+    rc = eif_llm_generate_vision_docling_from(llm, &vin, prompt, cfg, cb, user_data);
+    eif_llm_vision_input_free(&vin);
+    return rc;
 }
 
 void eif_llm_reset(eif_llm_t *llm)
