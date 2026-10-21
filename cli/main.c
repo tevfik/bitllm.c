@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 /**
  * @file main.c
  * @brief bitllm.c standalone CLI runner (bitllm-run; formerly EIF-Runtime eif-run)
@@ -47,8 +48,9 @@ static void print_usage(const char *prog)
     printf("  -t, --tokenizer <path>   Path to custom tokenizer.bin\n");
     printf("  -T, --temp <float>       Sampling temperature (default: 0.7, 0.0=argmax; 0.0 with --image)\n");
     printf("  --top-p <float>          Nucleus top-p threshold (default: 0.9)\n");
-    printf("  -r, --rep-penalty <val>  Repetition penalty factor (default: 1.15, 1.0=none; 1.0 with --image)\n");
+    printf("  -r, --rep-penalty <val>  Repetition penalty factor (default: 1.0 = none)\n");
     printf("  --no-loop-guard          Do not stop DocTags generation that repeats one pattern (--image)\n");
+    printf("  --raw                    Do not wrap the prompt in the ChatML template (Qwen2 instruct models)\n");
     printf("  --gpu                    Run the vision encoder on a Vulkan GPU (graceful CPU fallback)\n");
     printf("  --kv-int8                Enable INT8 quantized KV cache (75%% memory reduction)\n\n");
     printf("Examples:\n");
@@ -140,9 +142,10 @@ int main(int argc, char **argv)
     const char *tokenizer_path = NULL;
     float temperature = 0.7f;
     float top_p = 0.9f;
-    float rep_penalty = 1.15f;
+    float rep_penalty = 1.0f;
     bool temp_set = false, rep_set = false; /* explicit -T / -r win over the image-mode defaults */
     bool use_gpu = false;
+    bool raw_prompt = false;
     int loop_guard = 0;
     int kv_type = 0;
 
@@ -167,6 +170,8 @@ int main(int argc, char **argv)
             if (i + 1 < argc) { rep_penalty = (float)atof(argv[++i]); rep_set = true; }
         } else if (strcmp(argv[i], "--no-loop-guard") == 0) {
             loop_guard = -1;
+        } else if (strcmp(argv[i], "--raw") == 0) {
+            raw_prompt = true;
         } else if (strcmp(argv[i], "--gpu") == 0) {
             use_gpu = true;
         } else if (strcmp(argv[i], "--kv-int8") == 0) {
@@ -343,6 +348,12 @@ int main(int argc, char **argv)
             }
             prompt_to_use = formatted_prompt;
         }
+    } else if (llm.arch == EIF_LLM_ARCH_QWEN2 && !raw_prompt && image_path == NULL &&
+               strstr(prompt, "<|im_start|>") == NULL &&
+               (strcasestr(model_path, "instruct") || strcasestr(model_path, "chat"))) {
+        snprintf(formatted_prompt, sizeof(formatted_prompt),
+                 "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n", prompt);
+        prompt_to_use = formatted_prompt;
     } else if (image_path != NULL) {
         if (strstr(prompt, "<|image|>") == NULL) {
             snprintf(formatted_prompt, sizeof(formatted_prompt),
