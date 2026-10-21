@@ -3277,21 +3277,21 @@ static void load_embedding_tensor(
 
     if (src_type == GGUF_TYPE_Q8_0) {
         int blocks_per_row = (dim + 31) / 32;
-        const uint8_t *src_bytes = (const uint8_t *)src_data;
-        for (int v = 0; v < vocab_size; v++) {
-            const uint8_t *row_src = src_bytes + (size_t)v * blocks_per_row * 34;
-            float max_s = 0.0f;
-            for (int b = 0; b < blocks_per_row; b++) {
-                const uint8_t *blk = row_src + b * 34;
-                float sc = fp16_to_fp32(*(const uint16_t *)blk);
-                if (sc > max_s) max_s = sc;
-                const int8_t *qs = (const int8_t *)(blk + 2);
-                int count = (b == blocks_per_row - 1) ? (dim - b * 32) : 32;
-                for (int i = 0; i < count; i++) {
-                    dest_w[(size_t)v * dim + b * 32 + i] = qs[i];
+        float *row_buf = (float *)malloc((size_t)blocks_per_row * 32 * sizeof(float));
+        if (row_buf) {
+            const uint8_t *src_bytes = (const uint8_t *)src_data;
+            for (int v = 0; v < vocab_size; v++) {
+                const uint8_t *row_src = src_bytes + (size_t)v * blocks_per_row * 34;
+                for (int b = 0; b < blocks_per_row; b++) {
+                    const uint8_t *blk = row_src + b * 34;
+                    uint16_t h16; memcpy(&h16, blk, 2);
+                    float sc = fp16_to_fp32(h16);
+                    const int8_t *qs = (const int8_t *)(blk + 2);
+                    for (int i = 0; i < 32; i++) row_buf[b * 32 + i] = sc * qs[i];
                 }
+                quantize_row_f32_to_int8(dest_w + (size_t)v * dim, &dest_scales[v], row_buf, dim);
             }
-            dest_scales[v] = (max_s > 0.0f) ? max_s : 1.0f;
+            free(row_buf);
         }
     } else if (src_type == GGUF_TYPE_Q4_0 || src_type == GGUF_TYPE_Q4_1 ||
                src_type == GGUF_TYPE_Q4_K || src_type == GGUF_TYPE_Q6_K) {
@@ -3454,21 +3454,21 @@ static void load_projection_tensor(
         int8_t *dst = (int8_t *)dest_w;
         if (src_type == GGUF_TYPE_Q8_0) {
             int blocks = (cols + 31) / 32;
-            const uint8_t *src_bytes = (const uint8_t *)src_data;
-            for (int r = 0; r < rows; r++) {
-                const uint8_t *r_src = src_bytes + (size_t)r * blocks * 34;
-                float max_s = 0.0f;
-                for (int b = 0; b < blocks; b++) {
-                    const uint8_t *blk = r_src + b * 34;
-                    float sc = fp16_to_fp32(*(const uint16_t *)blk);
-                    if (sc > max_s) max_s = sc;
-                    const int8_t *qs = (const int8_t *)(blk + 2);
-                    int count = (b == blocks - 1) ? (cols - b * 32) : 32;
-                    for (int i = 0; i < count; i++) {
-                        dst[(size_t)r * cols + b * 32 + i] = qs[i];
+            float *row_buf = (float *)malloc((size_t)blocks * 32 * sizeof(float));
+            if (row_buf) {
+                const uint8_t *src_bytes = (const uint8_t *)src_data;
+                for (int r = 0; r < rows; r++) {
+                    const uint8_t *r_src = src_bytes + (size_t)r * blocks * 34;
+                    for (int b = 0; b < blocks; b++) {
+                        const uint8_t *blk = r_src + b * 34;
+                        uint16_t h16; memcpy(&h16, blk, 2);
+                        float sc = fp16_to_fp32(h16);
+                        const int8_t *qs = (const int8_t *)(blk + 2);
+                        for (int i = 0; i < 32; i++) row_buf[b * 32 + i] = sc * qs[i];
                     }
+                    quantize_row_f32_to_int8(dst + (size_t)r * cols, &dest_scales[r], row_buf, cols);
                 }
-                dest_scales[r] = (max_s > 0.0f) ? max_s : 1.0f;
+                free(row_buf);
             }
         } else if (src_type == GGUF_TYPE_Q4_0 || src_type == GGUF_TYPE_Q4_1 ||
                    src_type == GGUF_TYPE_Q4_K || src_type == GGUF_TYPE_Q6_K) {
@@ -3783,13 +3783,13 @@ int tinyllm_load_gguf(tinyllm_t *llm, const char *filename, void *quant_buffer, 
         snprintf(name, sizeof(name), "blk.%d.attn_k.weight", l);
         raw = find_gguf_tensor(tdescs, (int)n_tensors, data_start, name, &ttype);
         load_projection_tensor((uint8_t *)llm->weights.wk + (size_t)l * kv_dim * dim_packed,
-                               llm->weights.attn_scale + (size_t)l * attn_scales_per_layer + q_dim,
+                               llm->weights.attn_scale + (size_t)l * attn_scales_per_layer + ((cp->head_dim > 0 && cp->head_dim != dim / cp->n_heads) ? q_dim : dim),
                                raw, ttype, kv_dim, dim, cp->qtype);
 
         snprintf(name, sizeof(name), "blk.%d.attn_v.weight", l);
         raw = find_gguf_tensor(tdescs, (int)n_tensors, data_start, name, &ttype);
         load_projection_tensor((uint8_t *)llm->weights.wv + (size_t)l * kv_dim * dim_packed,
-                               llm->weights.attn_scale + (size_t)l * attn_scales_per_layer + q_dim + kv_dim,
+                               llm->weights.attn_scale + (size_t)l * attn_scales_per_layer + ((cp->head_dim > 0 && cp->head_dim != dim / cp->n_heads) ? (q_dim + kv_dim) : (dim * 2)),
                                raw, ttype, kv_dim, dim, cp->qtype);
 
         if (llm->weights.bq) {
@@ -3815,7 +3815,7 @@ int tinyllm_load_gguf(tinyllm_t *llm, const char *filename, void *quant_buffer, 
             raw = find_gguf_tensor(tdescs, (int)n_tensors, data_start, name, &ttype);
         }
         load_projection_tensor((uint8_t *)llm->weights.wo + (size_t)l * dim * q_dim_packed,
-                               llm->weights.attn_scale + (size_t)l * attn_scales_per_layer + q_dim + kv_dim * 2,
+                               llm->weights.attn_scale + (size_t)l * attn_scales_per_layer + ((cp->head_dim > 0 && cp->head_dim != dim / cp->n_heads) ? (q_dim + kv_dim * 2) : (dim * 2 + kv_dim)),
                                raw, ttype, dim, q_dim, cp->qtype);
 
         snprintf(name, sizeof(name), "blk.%d.ffn_gate.weight", l);
@@ -3827,13 +3827,13 @@ int tinyllm_load_gguf(tinyllm_t *llm, const char *filename, void *quant_buffer, 
         snprintf(name, sizeof(name), "blk.%d.ffn_down.weight", l);
         raw = find_gguf_tensor(tdescs, (int)n_tensors, data_start, name, &ttype);
         load_projection_tensor((uint8_t *)llm->weights.w2 + (size_t)l * dim * hidden_packed,
-                               llm->weights.ffn_scale + (size_t)l * (hidden_dim * 2 + dim) + hidden_dim,
+                               llm->weights.ffn_scale + (size_t)l * (hidden_dim * 2 + dim) + hidden_dim * 2,
                                raw, ttype, dim, hidden_dim, cp->qtype);
 
         snprintf(name, sizeof(name), "blk.%d.ffn_up.weight", l);
         raw = find_gguf_tensor(tdescs, (int)n_tensors, data_start, name, &ttype);
         load_projection_tensor((uint8_t *)llm->weights.w3 + (size_t)l * hidden_dim * dim_packed,
-                               llm->weights.ffn_scale + (size_t)l * (hidden_dim * 2 + dim) + hidden_dim + dim,
+                               llm->weights.ffn_scale + (size_t)l * (hidden_dim * 2 + dim) + hidden_dim,
                                raw, ttype, hidden_dim, dim, cp->qtype);
     }
 
