@@ -1232,6 +1232,19 @@ int qwen35_load(qwen35_t *m, const char *path, void *state_mem, size_t state_sz)
 
     m->file_data = data;  m->file_size = st.st_size;  m->file_is_mmap = 1;
 
+    /* A standard Qwen3.5 GGUF is repacked in memory into the image layout below. */
+    uint32_t first4 = 0;
+    memcpy(&first4, data, st.st_size >= 4 ? 4 : 0);
+    if (first4 == 0x46554747u) {
+        void *img = NULL; size_t img_sz = 0;
+        int rc = qwen35_gguf_build_image((const uint8_t *)data, (size_t)st.st_size, &img, &img_sz);
+        munmap(data, st.st_size);
+        m->file_data = NULL;
+        if (rc != 0) { fprintf(stderr, "qwen35_load: cannot load GGUF (code %d)\n", rc); return rc; }
+        data = img;
+        m->file_data = img; m->file_size = img_sz; m->file_is_mmap = 0;
+    }
+
     const uint8_t *base = (const uint8_t *)data;
     const qwen35_file_header_t *hdr = (const qwen35_file_header_t *)base;
 
@@ -1486,6 +1499,8 @@ void qwen35_reset(qwen35_t *m) {
 void qwen35_free(qwen35_t *m) {
     if (m->file_is_mmap && m->file_data)
         munmap(m->file_data, m->file_size);
+    else if (m->file_data)
+        free(m->file_data); /* in-memory image built from a GGUF */
     memset(m, 0, sizeof(qwen35_t));
 }
 

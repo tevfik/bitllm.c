@@ -267,6 +267,9 @@ size_t qwen35_state_size(const qwen35_config_t *cfg);
  */
 int qwen35_load(qwen35_t *model, const char *path, void *state_mem, size_t state_sz);
 
+/** Repack a llama.cpp style Qwen3.5 text GGUF into an in-memory .eifm image (INT4 linears, INT8 embedding); malloc'd. */
+int qwen35_gguf_build_image(const uint8_t *file, size_t file_size, void **out_img, size_t *out_size);
+
 /**
  * @brief Free resources (unmap file, free state if needed).
  */

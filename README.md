@@ -15,7 +15,7 @@ Designed from the ground up for seamless embedding into applications (such as [g
 - **Native Vision Language Model (VLM) Support**: Integrated SigLIP2 vision encoder and Docling OCR/DocVQA vision projection.
 - **Embedded Byte-Level BPE Tokenizer**: 100% byte-exact parity with HuggingFace tokenizers via C99 pre-tokenization regex and rank-based BPE merges.
 - **Flexible Memory Model**: Designed for embedding without rigid MCU limitations; supports system allocators or custom user-provided memory pools.
-- **Dual Format Support**: Reads `.eifm` (Edge Intelligence Format Model) and `.gguf` weights directly.
+- **Dual Format Support**: Reads `.eifm` (Edge Intelligence Format Model) and `.gguf` weights directly. Qwen2/2.5 GGUFs run through the dense INT8 path; llama.cpp style Qwen3.5 text GGUFs (F16/Q8_0/Q4_K/Q5_K/Q6_K, 24 layers, tied head) are repacked in memory to INT4 row-scaled linears on load (`Q8_0` keeps the best quality; `Q4_K_M` is re-quantised twice and degrades on long answers). Vision, untied heads and other layer counts are not supported.
 - **Optional Vulkan GPU Compute**: the SigLIP2 vision encoder runs on any Vulkan GPU (`--gpu`); the loader is opened at runtime, so builds need no Vulkan SDK and machines without a GPU fall back to the AVX2/NEON/OpenMP CPU path.
 
 ---

@@ -47,6 +47,7 @@ include_directories(include)
 set(BITLLM_SOURCES
     src/eif_llm.c
     src/eif_qwen35.c
+    src/eif_qwen35_gguf.c
     src/eif_tinyllm.c
     src/eif_bpe_tokenizer.c
     src/eif_quantize_bitnet.c
@@ -223,6 +224,16 @@ if(OpenMP_C_FOUND)
     target_link_libraries(test_gguf_gqa_layout PRIVATE OpenMP::OpenMP_C)
 endif()
 
+# 9h. Qwen3.5 GGUF -> in-memory .eifm image (test_qwen35_gguf_load)
+add_executable(test_qwen35_gguf_load tests/test_qwen35_gguf_load.c)
+target_link_libraries(test_qwen35_gguf_load PRIVATE bitllm_static)
+if(NOT WIN32)
+    target_link_libraries(test_qwen35_gguf_load PRIVATE m)
+endif()
+if(OpenMP_C_FOUND)
+    target_link_libraries(test_qwen35_gguf_load PRIVATE OpenMP::OpenMP_C)
+endif()
+
 # 9f. Context bound of the KV cache (test_seq_bounds)
 add_executable(test_seq_bounds tests/test_seq_bounds.c)
 target_link_libraries(test_seq_bounds PRIVATE bitllm_static)
@@ -286,6 +297,7 @@ add_test(NAME test_int8_gemv COMMAND test_int8_gemv)
 add_test(NAME test_gemm COMMAND test_gemm)
 add_test(NAME test_seq_bounds COMMAND test_seq_bounds)
 add_test(NAME test_gguf_gqa_layout COMMAND test_gguf_gqa_layout)
+add_test(NAME test_qwen35_gguf_load COMMAND test_qwen35_gguf_load)
 add_test(NAME test_q35_int4 COMMAND test_q35_int4)
 add_test(NAME test_siglip_int8_gemm COMMAND test_siglip_int8_gemm)
 add_test(NAME test_all_features COMMAND test_all_features)
