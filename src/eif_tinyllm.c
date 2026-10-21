@@ -1689,6 +1689,13 @@ void tinyllm_matmul_int8_rowscale(float *y, const int8_t *w, const float *x, int
         I8_HSUM(a1, s1);
         I8_HSUM(a2, s2);
         I8_HSUM(a3, s3);
+        /* columns beyond the last full group of 8 */
+        for (int c = cols & ~7; c < cols; c++) {
+            s0 += (float)w0[c] * x[c];
+            s1 += (float)w1[c] * x[c];
+            s2 += (float)w2[c] * x[c];
+            s3 += (float)w3[c] * x[c];
+        }
         y[r]     = s0 * (scales ? scales[r] : 1.0f);
         y[r + 1] = s1 * (scales ? scales[r + 1] : 1.0f);
         y[r + 2] = s2 * (scales ? scales[r + 2] : 1.0f);
