@@ -124,6 +124,9 @@ typedef struct {
  */
 eif_llm_arch_t eif_llm_detect_arch(const char *model_path);
 
+/** Map a GGUF general.architecture name to a runtime (EIF_LLM_ARCH_UNKNOWN if unsupported). */
+eif_llm_arch_t eif_llm_arch_from_name(const char *arch);
+
 /**
  * @brief Calculate recommended buffer size (RAM) for model execution.
  *
@@ -290,6 +293,18 @@ float *eif_llm_get_hidden_state(eif_llm_t *llm);
  * @return 0 on success, negative error code on failure
  */
 int eif_llm_embed(eif_llm_t *llm, const char *prompt, float *out_embedding, eif_llm_pool_mode_t pool_mode);
+
+/**
+ * @brief Cross-encoder relevance scores (bge-reranker-v2-m3 and similar GGUF rerankers).
+ *
+ * @param llm     Engine handle loaded from a reranker GGUF (BERT/XLM-R backbone with a cls.* head)
+ * @param query   Query text
+ * @param docs    Candidate documents
+ * @param n_docs  Number of documents
+ * @param scores  Output relevance logits [n_docs]; higher is more relevant, sigmoid() maps to 0..1
+ * @return 0 on success; -1 bad arguments, -3 the model is not a reranker, other negatives from tokenisation
+ */
+int eif_llm_rerank(eif_llm_t *llm, const char *query, const char **docs, int n_docs, float *scores);
 
 /**
  * @brief Compute cosine similarity between two float vectors.

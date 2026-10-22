@@ -23,17 +23,36 @@
 
 #define DEFAULT_BUFFER_SIZE (256 * 1024 * 1024) /* 256 MB */
 
+/* Map a GGUF general.architecture string to a runtime. Unknown names are NOT
+ * routed to the LLaMA path any more: that used to turn encoders and other
+ * decoders (gemma-embedding, modern-bert, gemma3, ...) into silent garbage. */
+eif_llm_arch_t eif_llm_arch_from_name(const char *a)
+{
+    static const char *const bert_like[] = {
+        "bert", "nomic-bert", "jina-bert-v2", "modern-bert",
+        "gemma-embedding", "gemma-embedding2", NULL };
+    static const char *const llama_like[] = {
+        "llama", "mistral", "granite", "minicpm", "smollm", "bitnet",
+        "bitnet-25", "bitnet-b1.58", NULL };
+    if (!a) return EIF_LLM_ARCH_UNKNOWN;
+    for (int i = 0; bert_like[i]; i++)  if (strcmp(a, bert_like[i]) == 0)  return EIF_LLM_ARCH_BERT;
+    if (strcmp(a, "qwen3") == 0 || strcmp(a, "qwen35") == 0) return EIF_LLM_ARCH_QWEN35;
+    if (strcmp(a, "qwen2") == 0 || strcmp(a, "qwen2.5") == 0) return EIF_LLM_ARCH_QWEN2;
+    for (int i = 0; llama_like[i]; i++) if (strcmp(a, llama_like[i]) == 0) return EIF_LLM_ARCH_SMOLLM2;
+    return EIF_LLM_ARCH_UNKNOWN;
+}
+
 static eif_llm_arch_t detect_gguf_arch(const char *model_path)
 {
     FILE *f = fopen(model_path, "rb");
-    if (!f) return EIF_LLM_ARCH_BERT;
+    if (!f) return EIF_LLM_ARCH_UNKNOWN;
 
     uint32_t magic = 0, ver = 0;
     uint64_t n_tensors = 0, n_kv = 0;
     if (fread(&magic, 4, 1, f) != 1 || fread(&ver, 4, 1, f) != 1 ||
         fread(&n_tensors, 8, 1, f) != 1 || fread(&n_kv, 8, 1, f) != 1) {
         fclose(f);
-        return EIF_LLM_ARCH_BERT;
+        return EIF_LLM_ARCH_UNKNOWN;
     }
     if (magic != 0x46554747) {
         fclose(f);
@@ -61,15 +80,9 @@ static eif_llm_arch_t detect_gguf_arch(const char *model_path)
             if (fread(arch_val, 1, sread, f) != sread) break;
             arch_val[sread] = '\0';
 
-            if (strcmp(arch_val, "bert") == 0 || strcmp(arch_val, "nomic-bert") == 0) {
-                result = EIF_LLM_ARCH_BERT;
-            } else if (strcmp(arch_val, "qwen3") == 0 || strcmp(arch_val, "qwen35") == 0) {
-                result = EIF_LLM_ARCH_QWEN35;
-            } else if (strcmp(arch_val, "qwen2") == 0 || strcmp(arch_val, "qwen2.5") == 0) {
-                result = EIF_LLM_ARCH_QWEN2;
-            } else {
-                result = EIF_LLM_ARCH_SMOLLM2;
-            }
+            result = eif_llm_arch_from_name(arch_val);
+            if (result == EIF_LLM_ARCH_UNKNOWN)
+                fprintf(stderr, "[EIF LLM Error] Unsupported GGUF architecture '%s'\n", arch_val);
             break;
         }
 
@@ -99,7 +112,7 @@ static eif_llm_arch_t detect_gguf_arch(const char *model_path)
         }
     }
     fclose(f);
-    return (result != EIF_LLM_ARCH_UNKNOWN) ? result : EIF_LLM_ARCH_BERT;
+    return result;
 }
 
 eif_llm_arch_t eif_llm_detect_arch(const char *model_path)
@@ -1085,6 +1098,13 @@ float *eif_llm_get_hidden_state(eif_llm_t *llm)
     } else {
         return tinyllm_get_hidden_state(&llm->backend.tinyllm);
     }
+}
+
+int eif_llm_rerank(eif_llm_t *llm, const char *query, const char **docs, int n_docs, float *scores)
+{
+    if (!llm || !llm->is_initialized || !query || !docs || !scores || n_docs <= 0) return -1;
+    if (llm->arch != EIF_LLM_ARCH_BERT) return -3;
+    return eif_bert_rank_batch(&llm->backend.bert, query, docs, n_docs, scores);
 }
 
 int eif_llm_embed(eif_llm_t *llm, const char *prompt, float *out_embedding, eif_llm_pool_mode_t pool_mode)
