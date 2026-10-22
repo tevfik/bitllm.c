@@ -1841,7 +1841,7 @@ static int eif_bert_load_gguf(eif_bert_t *bert, const uint8_t *addr, size_t file
     /* Fused attn_qkv (nomic-bert): rows [0,dim) are Q, [dim,2dim) K, [2dim,3dim) V, so the three projections
      * are plain row offsets into the same tensor (Q8_0 / F32 only, the layouts bert_gemm reads). */
     for (int l = 0; l < n_layers; l++) {
-        if (bert->weights.q_w[l]) continue;
+        if (bert->weights.q_w[l] || !bert->config.use_rope) continue; /* only nomic-bert's layout is known; modern-bert differs */
         uint32_t ft = 0;
         snprintf(tname, sizeof(tname), "blk.%d.attn_qkv.weight", l);
         const uint8_t *f = (const uint8_t *)find_gguf_tensor(tdescs, (int)n_tensors, data_start, tname, &ft);
