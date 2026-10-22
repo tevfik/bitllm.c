@@ -288,6 +288,49 @@ static size_t pretoken_len(const char *p, const char *end)
     return (size_t)l0;
 }
 
+/* GPT-2 / RoBERTa pre-tokenizer (what llama.cpp uses for jina-v2-code and plain gpt2 vocabularies):
+ *   's|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+
+ * Differs from the Qwen split above: digits group, whitespace runs keep all but the last blank. */
+static size_t pretoken_len_gpt2(const char *p, const char *end)
+{
+    uint32_t c0;
+    int l0;
+    cp_class_t k0 = class_at(p, end, &l0, &c0);
+    if (c0 == '\'' && p + 1 < end) {
+        char a = p[1];
+        if (a == 's' || a == 't' || a == 'm' || a == 'd') return 2;
+        if (p + 2 < end) {
+            char b = p[2];
+            if ((a == 'r' && b == 'e') || (a == 'v' && b == 'e') || (a == 'l' && b == 'l')) return 3;
+        }
+    }
+    const char *q = p;
+    if (c0 == ' ' && p + 1 < end) q = p + 1;
+    uint32_t c;
+    int l;
+    cp_class_t k = class_at(q, end, &l, &c);
+    if (k == CP_LETTER || k == CP_MARK) {
+        while (q < end && ((k = class_at(q, end, &l, &c)) == CP_LETTER || k == CP_MARK)) q += l;
+        return (size_t)(q - p);
+    }
+    if (k == CP_NUMBER) {
+        while (q < end && class_at(q, end, &l, &c) == CP_NUMBER) q += l;
+        return (size_t)(q - p);
+    }
+    if (k == CP_OTHER) {
+        while (q < end && class_at(q, end, &l, &c) == CP_OTHER) q += l;
+        return (size_t)(q - p);
+    }
+    if (k0 == CP_SPACE) {
+        const char *e = p, *prev = p;
+        while (e < end && class_at(e, end, &l, &c) == CP_SPACE) { prev = e; e += l; }
+        if (e >= end) return (size_t)(e - p);
+        if (prev > p) return (size_t)(prev - p);
+        return (size_t)(e - p);
+    }
+    return (size_t)l0;
+}
+
 static void bpe_merge_range(const eif_bpe_tokenizer_t *tok, int32_t *work, int start, int *n_tokens,
                             bool skip_special)
 {
@@ -389,7 +432,7 @@ int eif_bpe_tokenizer_encode(const eif_bpe_tokenizer_t *tok, const char *text,
         if (tok->is_byte_bpe) {
             /* Pre-tokenize, then byte-map and merge each chunk independently */
             const char *end = text + text_len;
-            size_t plen = pretoken_len(c, end);
+            size_t plen = tok->pretok_gpt2 ? pretoken_len_gpt2(c, end) : pretoken_len(c, end);
             /* stop the chunk at the next special tag so it is handled by the check above */
             for (size_t k = 1; k < plen; k++) {
                 if (c[k] != '<') continue;

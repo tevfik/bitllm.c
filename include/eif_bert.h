@@ -30,7 +30,8 @@ extern "C" {
 #endif
 
 typedef struct {
-    int dim;              /**< Hidden dimension (e.g. 384) */
+    int dim;              /**< OUTPUT embedding dimension (post-projection; e.g. 384) */
+    int dim_model;        /**< Backbone hidden dimension (0 = dim; EmbeddingGemma2: 512 backbone -> 768 out) */
     int intermediate_dim; /**< FFN intermediate dimension (e.g. 1536) */
     int n_layers;         /**< Number of transformer encoder layers (e.g. 6) */
     int n_heads;          /**< Number of attention heads (e.g. 12) */
@@ -45,9 +46,14 @@ typedef struct {
     int   n_kv_heads;      /**< KV heads; 0 = same as n_heads (MHA) */
     int   head_dim;        /**< Per-head dim; 0 = dim / n_heads */
     float rope_freq_base;  /**< RoPE theta (att_type==2, e.g. 1e6) */
+    float rope_freq_base_swa; /**< RoPE theta for SWA layers (gemma-embedding2: 1e4) */
+    int   sliding_window;  /**< SWA window from GGUF (0 = unknown) */
     int   norm_style;      /**< 0=LayerNorm, 1=Gemma RMS * (1+w) */
     float norm_eps;        /**< LN eps (1e-12 default) / RMS eps (1e-6) */
     float emb_scale;       /**< 0=none; else embeddings *= this before first norm (gemma: sqrt(dim)) */
+    float attn_scale;      /**< 0=legacy 1/sqrt(head_dim); else fixed attention scale
+                             *   (gemma-embedding2 uses 1.0: QK-norm makes scaling redundant) */
+    int   n_embd_per_layer;/**< Per-layer embedding width (gemma-embedding2: 512; 0 = unsupported) */
 } eif_bert_config_t;
 
 typedef struct {
@@ -58,6 +64,14 @@ typedef struct {
     bool         pos_emb_allocated;
     int          pos_rows;  /**< actual row count of position_embd (0 = full context) */
     const float *type_emb;
+    int          type_rows;   /**< segment-embedding rows (BERT 2, XLM-R 1) */
+    /* Cross-encoder head (cls.*), NULL for plain embedding models */
+    const void  *cls_w;       /**< [dim x dim] dense layer, Q8_0 (cls_qtype 2) or FP32 (0) */
+    int          cls_qtype;
+    float       *cls_w_owned; /**< FP32 copy when the file stores FP16 */
+    const float *cls_b;
+    const float *cls_out_w;   /**< [dim] output projection */
+    float        cls_out_b;
     const float *emb_norm_w;
     const float *emb_norm_b;
 
@@ -111,6 +125,19 @@ typedef struct {
     const float **pre_ffn_norm_w;     /**< blk.N.ffn_norm.weight (pre-FFN) */
     const float **post_ffw_norm_w;    /**< blk.N.post_ffw_norm.weight (FFN output, before residual) */
     const float  *output_norm_w;      /**< output_norm.weight (final) */
+
+    /* gemma-embedding2 (EmbeddingGemma-2): per-layer embeddings (PLE) +
+     * per-layer head config + final output projection. */
+    const void  **g2_inp_gate;        /**< blk.N.inp_gate.weight [dim,dim] */
+    const void  **g2_proj;            /**< blk.N.proj.weight [dim,dim] */
+    const float **g2_post_norm;       /**< blk.N.post_norm.weight [dim] */
+    const float **g2_out_scale;       /**< blk.N.layer_output_scale.weight [1] */
+    const float  *g2_pl_model_proj;   /**< per_layer_model_proj [dim, dim*n_layers] (dequantized BF16) */
+    const float  *g2_pl_proj_norm;    /**< per_layer_proj_norm [dim] */
+    const void  *g2_out;              /**< output.weight [dim_model, dim_out] final projection */
+    int          *g2_head_dim;        /**< per-layer head dim (256 SWA / 512 global) */
+    int          *g2_n_kv;            /**< per-layer KV head count (2 SWA / 1 global) */
+    int           g2_max_q_dim;       /**< max over layers of n_heads*head_dim (scratch sizing) */
 } eif_bert_weights_t;
 
 #include "eif_bpe_tokenizer.h"
@@ -132,6 +159,16 @@ typedef struct {
     int unk_id;
     int pad_id;
     bool is_spm_prefix;
+    float *scores;       /**< tokenizer.ggml.scores (Unigram models), NULL otherwise */
+    char **merge_strs;      /**< tokenizer.ggml.merges ("left right", rank = index) for BPE vocabularies */
+    int32_t *merge_hash;    /**< open-addressing table: merge rank + 1, 0 = empty */
+    int n_merges;
+    uint32_t merge_mask;
+    bool bpe_merges;        /**< Gemma4-style SPM BPE (merge ranks over raw UTF-8, spaces escaped to U+2581) */
+    bool spm_bigram;     /**< llama.cpp SentencePiece merge tokenisation (tokenizer.ggml.model == "llama") */
+    bool add_space_prefix; /**< prepend U+2581 to the first word (tokenizer.ggml.add_space_prefix) */
+    bool unigram;        /**< Viterbi Unigram tokenisation (tokenizer.ggml.model == "t5") */
+    bool lowercase;      /**< lowercase input before WordPiece lookup (uncased BERT vocab) */
     eif_bert_tokenizer_type_t tok_type;
     eif_bpe_tokenizer_t bpe_tok;
 } eif_bert_vocab_t;
@@ -154,7 +191,12 @@ typedef struct {
     float *scratch_v;        /**< [max_seq_len * dim] */
     float *scratch_att;      /**< [n_heads * max_seq_len * max_seq_len] */
     float *scratch_inter;    /**< [max_seq_len * intermediate_dim] */
-    float *scratch_proj;     /**< [max_seq_len * dim] */
+    float *scratch_proj;     /**< [max_seq_len * max(dim, dim_out)] */
+    float *scratch_pl;       /**< gemma-embedding2: per-layer input table [max_t * dim_model * n_layers] (precomputed, RMS-normed) */
+    float *scratch_g2;       /**< gemma-embedding2: PLE gate scratch [max_t * dim_model] */
+    float *scratch_attout;   /**< gemma-embedding2: attention output accum [max_t * max_q_dim] (heads can exceed dim_model) */
+
+    int max_t_alloc;         /**< token capacity of the scratch buffers */
 
     bool is_initialized;
 } eif_bert_t;
@@ -187,10 +229,25 @@ int eif_bert_tokenize(const eif_bert_t *bert, const char *text, int32_t *out_tok
  *
  * @param bert          Loaded BERT engine
  * @param text          Input text to embed
- * @param out_embedding Output float buffer of size bert->config.dim
+ * @param out_embedding Output float buffer of size bert->config.dim (the
+ *                      OUTPUT embedding dim; gemma-embedding2: 768)
  * @return 0 on success, negative error code on failure
  */
 int eif_bert_embed(eif_bert_t *bert, const char *text, float *out_embedding);
+
+/** Tokenise a (query, document) pair: RoBERTa/XLM-R style `<s> a </s></s> b </s>`, BERT style
+ *  `[CLS] a [SEP] b [SEP]` with segment ids in @p types (0/1). The document is truncated to fit @p max_tokens.
+ *  @return number of tokens, negative on error. */
+int eif_bert_tokenize_pair(const eif_bert_t *bert, const char *a, const char *b, int32_t *out_tokens, uint8_t *out_types, int max_tokens);
+
+/** 1 if the model carries a cross-encoder head (cls.weight / cls.output.weight), e.g. bge-reranker-v2-m3. */
+int eif_bert_is_ranker(const eif_bert_t *bert);
+
+/** Relevance logit of @p doc for @p query (higher = more relevant; sigmoid() gives the 0..1 score). 0 on success. */
+int eif_bert_rank(eif_bert_t *bert, const char *query, const char *doc, float *score);
+
+/** Scores for several documents against one query. */
+int eif_bert_rank_batch(eif_bert_t *bert, const char *query, const char **docs, int n_docs, float *scores);
 
 /**
  * @brief Compute dense semantic embeddings for a batch of input texts.

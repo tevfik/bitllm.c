@@ -1,0 +1,8 @@
+# HF transformers fp32 reference (BAAI/bge-reranker-v2-m3): logit<TAB>n_tokens<TAB>query<TAB>document
+-8.18382	10	what is panda?	hi
+5.26504	43	what is panda?	The giant panda (Ailuropoda melanoleuca), sometimes called a panda bear or simply panda, is a bear species endemic to China.
+3.81799	39	how do I reset my password?	To reset your password, open Settings, choose Security and click 'Forgot password'. A link will be sent to your email.
+-11.00309	27	how do I reset my password?	The committee reviewed the annual budget and approved several infrastructure projects across the region.
+6.38206	28	Türkiye'nin başkenti neresidir?	Ankara, Türkiye Cumhuriyeti'nin başkentidir ve İç Anadolu Bölgesi'nde yer alır.
+-7.23860	26	Türkiye'nin başkenti neresidir?	Paris, Fransa'nın başkentidir ve Seine nehri kıyısındadır.
+5.21597	28	def add(a, b): return a + b	This function adds two numbers and returns their sum.

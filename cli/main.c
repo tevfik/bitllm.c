@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
+#include <math.h>
 #include <time.h>
 #ifdef _OPENMP
 #include <omp.h>
@@ -44,6 +45,7 @@ static void print_usage(const char *prog)
     printf("  -i, --image <path>       Document image for vision models (Granite-Docling)\n");
     printf("  -p, --prompt <str>       Input prompt text for generative LLMs\n");
     printf("  -e, --embed <str>        Compute dense embeddings for text (BERT / Granite / E5)\n");
+    printf("  --rerank <query> --doc <text> [--doc <text> ...]   Cross-encoder relevance scores (bge-reranker GGUF)\n");
     printf("  -n, --max-tokens <int>   Maximum new tokens to generate (default: 64)\n");
     printf("  -t, --tokenizer <path>   Path to custom tokenizer.bin\n");
     printf("  -T, --temp <float>       Sampling temperature (default: 0.7, 0.0=argmax; 0.0 with --image)\n");
@@ -137,6 +139,9 @@ int main(int argc, char **argv)
     const char *model_path = NULL;
     const char *prompt = "Hello world!";
     const char *embed_text = NULL;
+    const char *rerank_query = NULL;
+    const char *rerank_docs[64];
+    int n_rerank_docs = 0;
     const char *image_path = NULL;
     int max_tokens = 64;
     const char *tokenizer_path = NULL;
@@ -154,6 +159,10 @@ int main(int argc, char **argv)
             if (i + 1 < argc) prompt = argv[++i];
         } else if (strcmp(argv[i], "-e") == 0 || strcmp(argv[i], "--embed") == 0) {
             if (i + 1 < argc) embed_text = argv[++i];
+        } else if (strcmp(argv[i], "--rerank") == 0) {
+            if (i + 1 < argc) rerank_query = argv[++i];
+        } else if (strcmp(argv[i], "--doc") == 0) {
+            if (i + 1 < argc && n_rerank_docs < 64) rerank_docs[n_rerank_docs++] = argv[++i];
         } else if (strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0) {
             if (i + 1 < argc) model_path = argv[++i];
         } else if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--image") == 0) {
@@ -201,6 +210,31 @@ int main(int argc, char **argv)
         if (!rep_set) rep_penalty = 1.0f;
     }
 
+    /* Reranking mode: one relevance logit per --doc */
+    if (rerank_query != NULL) {
+        if (n_rerank_docs == 0) { fprintf(stderr, "[Error] --rerank needs at least one --doc\n"); return 1; }
+        eif_bert_t bert;
+        memset(&bert, 0, sizeof(bert));
+        int load_rc = eif_bert_load(&bert, model_path);
+        if (load_rc != 0) { fprintf(stderr, "[Error] Failed to load '%s' (rc=%d)\n", model_path, load_rc); return 1; }
+        if (!eif_bert_is_ranker(&bert)) {
+            fprintf(stderr, "[Error] '%s' has no cross-encoder head (cls.weight / cls.output.weight): not a reranker\n", model_path);
+            eif_bert_free(&bert);
+            return 1;
+        }
+        float scores[64];
+        double t0 = get_time_sec();
+        int rc = eif_bert_rank_batch(&bert, rerank_query, rerank_docs, n_rerank_docs, scores);
+        double dt = get_time_sec() - t0;
+        if (rc != 0) { fprintf(stderr, "[Error] reranking failed (rc=%d)\n", rc); eif_bert_free(&bert); return 1; }
+        printf("Query: \"%s\"\n", rerank_query);
+        for (int i = 0; i < n_rerank_docs; i++)
+            printf("  [%d] logit %+.4f  score %.4f  %s\n", i, scores[i], 1.0f / (1.0f + expf(-scores[i])), rerank_docs[i]);
+        printf("(%d pairs in %.2f s)\n", n_rerank_docs, dt);
+        eif_bert_free(&bert);
+        return 0;
+    }
+
     /* Dedicated Embedding Inference Mode */
     if (embed_text != NULL) {
         printf("=================================================================\n");
@@ -211,8 +245,9 @@ int main(int argc, char **argv)
 
         eif_bert_t bert;
         memset(&bert, 0, sizeof(bert));
-        if (eif_bert_load(&bert, model_path) != 0) {
-            fprintf(stderr, "\n[Error] Failed to load embedding model '%s'\n", model_path);
+        int load_rc = eif_bert_load(&bert, model_path);
+        if (load_rc != 0) {
+            fprintf(stderr, "\n[Error] Failed to load embedding model '%s' (eif_bert_load rc=%d)\n", model_path, load_rc);
             return 1;
         }
 

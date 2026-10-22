@@ -52,6 +52,7 @@ set(BITLLM_SOURCES
     src/eif_bpe_tokenizer.c
     src/eif_quantize_bitnet.c
     src/eif_bert.c
+    src/eif_bert_tokenizer.c
     src/eif_gpu.c
     src/eif_gemm.c
     src/eif_siglip.c
@@ -313,3 +314,52 @@ install(TARGETS bitllm_static bitllm_shared bitllm-run
     ARCHIVE DESTINATION lib
 )
 install(DIRECTORY include/ DESTINATION include)
+
+# 10. Embedding-model matrix vs llama.cpp (test_embed_matrix; needs BITLLM_MODELS, otherwise SKIP)
+add_executable(test_embed_matrix tests/test_embed_matrix.c)
+target_compile_definitions(test_embed_matrix PRIVATE EMBED_REF_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data/embed_ref")
+target_link_libraries(test_embed_matrix PRIVATE bitllm_static)
+if(NOT WIN32)
+    target_link_libraries(test_embed_matrix PRIVATE m)
+endif()
+if(OpenMP_C_FOUND)
+    target_link_libraries(test_embed_matrix PRIVATE OpenMP::OpenMP_C)
+endif()
+add_test(NAME test_embed_matrix COMMAND test_embed_matrix)
+set_tests_properties(test_embed_matrix PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
+
+# 11. Text-generation matrix (test_gen_matrix; needs BITLLM_GEN_MODELS, otherwise SKIP)
+add_executable(test_gen_matrix tests/test_gen_matrix.c)
+target_link_libraries(test_gen_matrix PRIVATE bitllm_static)
+if(NOT WIN32)
+    target_link_libraries(test_gen_matrix PRIVATE m)
+endif()
+if(OpenMP_C_FOUND)
+    target_link_libraries(test_gen_matrix PRIVATE OpenMP::OpenMP_C)
+endif()
+add_test(NAME test_gen_matrix COMMAND test_gen_matrix)
+set_tests_properties(test_gen_matrix PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
+
+# 12. RoPE layout of llama-family vs qwen2 GGUF (test_gguf_rope_layout)
+add_executable(test_gguf_rope_layout tests/test_gguf_rope_layout.c)
+target_link_libraries(test_gguf_rope_layout PRIVATE bitllm_static)
+if(NOT WIN32)
+    target_link_libraries(test_gguf_rope_layout PRIVATE m)
+endif()
+if(OpenMP_C_FOUND)
+    target_link_libraries(test_gguf_rope_layout PRIVATE OpenMP::OpenMP_C)
+endif()
+add_test(NAME test_gguf_rope_layout COMMAND test_gguf_rope_layout)
+
+# 13. Reranker vs HuggingFace reference (test_rerank_matrix; needs BITLLM_MODELS, otherwise SKIP)
+add_executable(test_rerank_matrix tests/test_rerank_matrix.c)
+target_compile_definitions(test_rerank_matrix PRIVATE RERANK_REF_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data/rerank_ref")
+target_link_libraries(test_rerank_matrix PRIVATE bitllm_static)
+if(NOT WIN32)
+    target_link_libraries(test_rerank_matrix PRIVATE m)
+endif()
+if(OpenMP_C_FOUND)
+    target_link_libraries(test_rerank_matrix PRIVATE OpenMP::OpenMP_C)
+endif()
+add_test(NAME test_rerank_matrix COMMAND test_rerank_matrix)
+set_tests_properties(test_rerank_matrix PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)

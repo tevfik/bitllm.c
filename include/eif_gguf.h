@@ -43,6 +43,7 @@ typedef enum {
     GGUF_TYPE_IQ1_S   = 19,
     GGUF_TYPE_TL1     = 34, /* BitNet b1.58 Ternary {-1, 0, +1} in bitnet.cpp / ggml */
     GGUF_TYPE_TL2     = 35,
+    GGUF_TYPE_BF16    = 30, /* bfloat16 (EmbeddingGemma-2 per_layer_model_proj) */
 } gguf_tensor_type_t;
 
 typedef struct {
@@ -110,6 +111,28 @@ static inline const void *find_gguf_tensor(
     for (int i = 0; i < n_tensors; i++) {
         if (strcmp(tensors[i].name, name) == 0) {
             if (out_type) *out_type = tensors[i].type;
+            return data_start + tensors[i].offset;
+        }
+    }
+    return NULL;
+}
+
+static inline const void *find_gguf_tensor_dims(
+    const gguf_tensor_desc_t *tensors,
+    int n_tensors,
+    const uint8_t *data_start,
+    const char *name,
+    uint32_t *out_type,
+    uint64_t *out_ne0,
+    uint64_t *out_ne1)
+{
+    if (out_ne0) *out_ne0 = 0;
+    if (out_ne1) *out_ne1 = 0;
+    for (int i = 0; i < n_tensors; i++) {
+        if (strcmp(tensors[i].name, name) == 0) {
+            if (out_type) *out_type = tensors[i].type;
+            if (out_ne0 && tensors[i].n_dims > 0) *out_ne0 = tensors[i].ne[0];
+            if (out_ne1 && tensors[i].n_dims > 1) *out_ne1 = tensors[i].ne[1];
             return data_start + tensors[i].offset;
         }
     }

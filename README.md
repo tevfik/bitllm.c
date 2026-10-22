@@ -20,6 +20,29 @@ Designed from the ground up for seamless embedding into applications (such as [g
 
 ---
 
+---
+
+## ✅ Supported models and how they are verified
+
+| Interface | Models (GGUF unless noted) | Reference / status |
+|---|---|---|
+| Text generation | Qwen2/2.5 (INT8 dense), Qwen3.5 0.8B/2B text (INT4 repack, 24 layers, tied head), LLaMA family (SmolLM2, Granite, MiniCPM; interleaved RoPE), BitNet, `.eifm` | greedy "Paris" check, repeatability, long prompt (`test_gen_matrix`) |
+| Embeddings | BERT/MiniLM/BGE/E5/Arctic (WordPiece), bge-m3 (Unigram), jina-v2-code (BPE), EmbeddingGemma 300m / 2 (SPM merge / Gemma4 BPE) | cosine vs llama.cpp on short, code and ~1400-token inputs (`test_embed_matrix`) |
+| Reranking | bge-reranker-v2-m3 (`--rerank Q --doc D ...`, `eif_llm_rerank`) | logit within 0.1 of HF fp32, same token ids (`test_rerank_matrix`) |
+| Vision + text | Granite-Docling (SigLIP2), Qwen3.5 `.eifm` | `test_docling_native`, `test_siglip_*` |
+| Audio | not supported | – |
+
+Refused at load with a clear error (no crash, no silent LLaMA fallback): nomic-bert (fused `attn_qkv`), modern-bert,
+unknown `general.architecture` values. Known gaps are listed in
+`KNOWN_GAPS` in `tests/test_embed_matrix.c` (currently none).
+
+Model-dependent tests are skipped unless pointed at the files:
+
+```bash
+BITLLM_MODELS=/path/to/embedding_and_reranker_ggufs BITLLM_GEN_MODELS=/path/to/chat_ggufs ctest --test-dir build
+# references: tests/data/embed_ref/*.ref (llama.cpp), tests/data/rerank_ref/*.tsv (HF); regenerate with tests/tools/
+```
+
 ## 🏗️ Architecture & Embedding
 
 `bitllm.c` builds both a standalone CLI (`bitllm-run`) and static/shared libraries (`libbitllm.a` / `libbitllm.so`) intended for direct integration into C/C++, Rust, Go, or Python hosts.

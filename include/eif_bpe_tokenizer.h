@@ -35,6 +35,7 @@ typedef struct {
     int bos_token_id;
     int eos_token_id;
     bool is_byte_bpe;
+    bool pretok_gpt2;   /**< GPT-2 split regex instead of the Qwen one (jina-v2-code, RoBERTa-style BPE) */
 } eif_bpe_tokenizer_t;
 
 /**
