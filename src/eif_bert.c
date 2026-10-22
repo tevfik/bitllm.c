@@ -1121,6 +1121,7 @@ static int bert_forward(eif_bert_t *bert, const int32_t *tokens, const uint8_t *
     float *PROJ = bert->scratch_proj;
 
     /* 1. Embedding Layer: Word + Pos + Token_Type -> LayerNorm */
+    #pragma omp parallel for schedule(dynamic, 8) if(T >= 32)
     for (int t = 0; t < T; t++) {
         int tid = tokens[t];
         float *x_t = X + t * dim;
@@ -1184,6 +1185,7 @@ static int bert_forward(eif_bert_t *bert, const int32_t *tokens, const uint8_t *
 
         /* 2a'. Optional Q/K LayerNorm over the full hidden vector (Jina v2 code) */
         if (bert->weights.q_norm_w) {
+            #pragma omp parallel for schedule(dynamic, 8) if(T >= 32)
             for (int t = 0; t < T; t++) {
                 bert_layernorm(Q + t * dim, Q + t * dim, bert->weights.q_norm_w[l], bert->weights.q_norm_b[l], dim, 1e-12f);
                 bert_layernorm(K + t * dim, K + t * dim, bert->weights.k_norm_w[l], bert->weights.k_norm_b[l], dim, 1e-12f);
@@ -1199,18 +1201,14 @@ static int bert_forward(eif_bert_t *bert, const int32_t *tokens, const uint8_t *
         }
 
         /* 2b. Multi-Head Bidirectional Self-Attention */
-#ifdef _OPENMP
-        int max_th_heads = omp_get_max_threads();
-        int head_th = (n_heads < max_th_heads) ? n_heads : max_th_heads;
-#else
-        int head_th = 1;
-#endif
-        #pragma omp parallel for schedule(static) num_threads(head_th)
-        for (int h = 0; h < n_heads; h++) {
-            float *att_h = ATT + h * T * T;
+        /* One task per (head, query row): heads alone (16 on 20 cores of two speeds) left cores idle, and rows
+         * are independent. Dynamic scheduling keeps the slower cores from setting the pace. */
+        #pragma omp parallel for schedule(dynamic, 4) if((int64_t)n_heads * T >= 64)
+        for (int hi = 0; hi < n_heads * T; hi++) {
+            const int h = hi / T, i = hi % T;
+            float *att_h = ATT + (size_t)h * T * T;
             float slope = use_alibi ? bert_alibi_slope(h, n_heads) : 0.0f;
-
-            for (int i = 0; i < T; i++) {
+            {
                 const float *q_i = Q + i * dim + h * head_dim;
                 float max_val = -1e9f;
 
@@ -1268,10 +1266,11 @@ static int bert_forward(eif_bert_t *bert, const int32_t *tokens, const uint8_t *
 
         /* 2c. Context Accumulation: C = Attn * V */
         memset(XB, 0, (size_t)T * dim * sizeof(float));
-        #pragma omp parallel for schedule(static) num_threads(head_th)
-        for (int h = 0; h < n_heads; h++) {
-            const float *att_h = ATT + h * T * T;
-            for (int i = 0; i < T; i++) {
+        #pragma omp parallel for schedule(dynamic, 4) if((int64_t)n_heads * T >= 64)
+        for (int hi = 0; hi < n_heads * T; hi++) {
+            const int h = hi / T, i = hi % T;
+            const float *att_h = ATT + (size_t)h * T * T;
+            {
                 float *c_ih = XB + i * dim + h * head_dim;
                 for (int j = 0; j < T; j++) {
                     float p_ij = att_h[i * T + j];
@@ -1311,6 +1310,7 @@ static int bert_forward(eif_bert_t *bert, const int32_t *tokens, const uint8_t *
 
         /* Residual Connection + LayerNorm */
         if (bert->weights.att_norm2_w) {
+            #pragma omp parallel for schedule(dynamic, 8) if(T >= 32)
             for (int t = 0; t < T; t++) {
                 float *x_t = X + t * dim;
                 const float *p_t = PROJ + t * dim;
@@ -1325,6 +1325,7 @@ static int bert_forward(eif_bert_t *bert, const int32_t *tokens, const uint8_t *
                 bert_layernorm(x_t, c_t, bert->weights.att_norm2_w[l], bert->weights.att_norm2_b[l], dim, 1e-12f);
             }
         } else {
+            #pragma omp parallel for schedule(dynamic, 8) if(T >= 32)
             for (int t = 0; t < T; t++) {
                 float *x_t = X + t * dim;
                 const float *p_t = PROJ + t * dim;
@@ -1359,6 +1360,7 @@ static int bert_forward(eif_bert_t *bert, const int32_t *tokens, const uint8_t *
                   H_INTER, bert->weights.ffn_down_b[l], T, dim, inter_dim, qtype);
 
         /* Residual Connection + LayerNorm */
+        #pragma omp parallel for schedule(dynamic, 8) if(T >= 32)
         for (int t = 0; t < T; t++) {
             float *x_t = X + t * dim;
             const float *f_t = PROJ + t * dim;

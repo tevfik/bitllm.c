@@ -987,7 +987,7 @@ static void bert_gemm_int8_gguf(
 {
     const int blocks_per_row = cols / 32;
     const size_t row_stride_bytes = (size_t)blocks_per_row * 34;
-    const int TILE_R = 64;
+    const int TILE_R = 2;
 
     /* Dynamic INT8 Block Quantization of input X */
     size_t xq_sz = (size_t)T * cols * sizeof(int8_t);
@@ -1003,6 +1003,7 @@ static void bert_gemm_int8_gguf(
         return;
     }
 
+#pragma omp parallel for schedule(static) if((int64_t)T * cols >= 65536)
     for (int t = 0; t < T; t++) {
         const float *xt = X + (size_t)t * cols;
         int8_t *xqt = xq + (size_t)t * cols;
@@ -1030,7 +1031,7 @@ static void bert_gemm_int8_gguf(
 #else
     int gemm_th = 1;
 #endif
-#pragma omp parallel for schedule(static) if((int64_t)rows * cols >= 4096) num_threads(gemm_th)
+#pragma omp parallel for schedule(dynamic, 1) if((int64_t)rows * cols >= 4096) num_threads(gemm_th)
     for (int r_tile = 0; r_tile < rows; r_tile += TILE_R) {
         int r_end = (r_tile + TILE_R <= rows) ? r_tile + TILE_R : rows;
 
