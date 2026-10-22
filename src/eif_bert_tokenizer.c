@@ -377,10 +377,210 @@ static int gemma4_bpe_tokenize(const eif_bert_vocab_t *v, const char *text, int3
     return n_out;
 }
 
+/* Byte-level BPE by merge rank (GGUF tokenizer.ggml.merges): GPT-2/RoBERTa pre-tokenizer, or for
+ * tokenizer.ggml.pre "granite-embed-multi-97m" the Granite one with ignore_merges (a pre-token that is a
+ * vocabulary entry is emitted as is). BOS/EOS around the text. Merges are applied by rank on the GPT-2 byte-mapped characters. */
+static int byte_bpe_tokenize(const eif_bert_vocab_t *v, const char *text, int32_t *out, int max_tokens)
+{
+    size_t n = strlen(text);
+    const char *end = text + n;
+    int n_out = 0;
+    out[n_out++] = (v->cls_id >= 0) ? v->cls_id : 0;
+    int max_body = max_tokens - 1;
+    char *mapped = (char *)malloc(n * 2 + 8);
+    if (!mapped) return -1;
+    for (const char *c = text; c < end && n_out < max_body;) {
+        size_t plen = v->byte_bpe == 2 ? eif_pretoken_len_granite(c, end) : eif_pretoken_len_gpt2(c, end);
+        if (plen == 0) plen = 1;
+        size_t m = 0;
+        for (size_t k = 0; k < plen; k++) {
+            const char *u = eif_bpe_byte_to_unicode((uint8_t)c[k]);
+            size_t ul = strlen(u);
+            memcpy(mapped + m, u, ul); m += ul;
+        }
+        mapped[m] = 0;
+        int id = v->byte_bpe == 2 ? ebert_find_token(v, mapped) : -1;   /* ignore_merges (Granite) */
+        if (id >= 0) out[n_out++] = id;
+        else if (bpe_emit_piece(v, mapped, m, out, &n_out, max_body) != 0) { free(mapped); return -1; }
+        c += plen;
+    }
+    free(mapped);
+    out[n_out++] = (v->sep_id >= 0) ? v->sep_id : 2;
+    return n_out;
+}
+
+/* ---------------------------------------------------------------------------
+ * WordPiece as llama.cpp does it (llm_tokenizer_wpm): NFD, strip combining marks, lowercase, split at
+ * whitespace, punctuation and CJK ideographs, then greedy longest match on "\xe2\x96\x81" + word (a word that
+ * cannot be fully matched becomes one [UNK]). Unicode tables are reduced to Latin, Greek and Cyrillic.
+ * ------------------------------------------------------------------------- */
+static int wp_decode(const unsigned char *p, const unsigned char *end, uint32_t *cp)
+{
+    unsigned char c = p[0];
+    int n = c < 0x80 ? 1 : c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1;
+    if (n == 1 || p + n > end) { *cp = c; return 1; }
+    uint32_t v = n == 2 ? (c & 0x1Fu) : n == 3 ? (c & 0x0Fu) : (c & 0x07u);
+    for (int i = 1; i < n; i++) {
+        if ((p[i] & 0xC0) != 0x80) { *cp = c; return 1; }
+        v = (v << 6) | (p[i] & 0x3Fu);
+    }
+    *cp = v;
+    return n;
+}
+
+static int wp_encode(uint32_t c, char *o)
+{
+    if (c < 0x80) { o[0] = (char)c; return 1; }
+    if (c < 0x800) { o[0] = (char)(0xC0 | (c >> 6)); o[1] = (char)(0x80 | (c & 0x3F)); return 2; }
+    if (c < 0x10000) { o[0] = (char)(0xE0 | (c >> 12)); o[1] = (char)(0x80 | ((c >> 6) & 0x3F)); o[2] = (char)(0x80 | (c & 0x3F)); return 3; }
+    o[0] = (char)(0xF0 | (c >> 18)); o[1] = (char)(0x80 | ((c >> 12) & 0x3F)); o[2] = (char)(0x80 | ((c >> 6) & 0x3F)); o[3] = (char)(0x80 | (c & 0x3F));
+    return 4;
+}
+
+static int wp_is_space(uint32_t c)
+{
+    return (c >= 9 && c <= 13) || c == 32 || c == 0x85 || c == 0xA0 || c == 0x1680 || (c >= 0x2000 && c <= 0x200A) ||
+           c == 0x2028 || c == 0x2029 || c == 0x202F || c == 0x205F || c == 0x3000;
+}
+
+static int wp_is_mark(uint32_t c)
+{
+    return (c >= 0x300 && c <= 0x36F) || (c >= 0x1AB0 && c <= 0x1AFF) || (c >= 0x1DC0 && c <= 0x1DFF) ||
+           (c >= 0x20D0 && c <= 0x20FF) || (c >= 0xFE20 && c <= 0xFE2F);
+}
+
+static int wp_is_punct(uint32_t c)
+{
+    if (c < 0x80) return !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'));
+    return c == 0xA1 || c == 0xA7 || c == 0xAB || c == 0xB6 || c == 0xB7 || c == 0xBB || c == 0xBF ||
+           (c >= 0x2010 && c <= 0x2027) || (c >= 0x2030 && c <= 0x205E) || (c >= 0x3001 && c <= 0x3003) ||
+           (c >= 0x3008 && c <= 0x3011) || (c >= 0x3014 && c <= 0x301F) || c == 0x30FB || (c >= 0xFE50 && c <= 0xFE6B) ||
+           (c >= 0xFF01 && c <= 0xFF03) || (c >= 0xFF05 && c <= 0xFF0A) || (c >= 0xFF0C && c <= 0xFF0F) ||
+           c == 0xFF1A || c == 0xFF1B || c == 0xFF1F || c == 0xFF20 || (c >= 0xFF3B && c <= 0xFF3D) || c == 0xFF3F ||
+           c == 0xFF5B || c == 0xFF5D || (c >= 0xFF5F && c <= 0xFF65);
+}
+
+static int wp_is_cjk(uint32_t c)
+{
+    return (c >= 0x4E00 && c <= 0x9FFF) || (c >= 0x3400 && c <= 0x4DBF) || (c >= 0x20000 && c <= 0x2A6DF) ||
+           (c >= 0x2A700 && c <= 0x2B73F) || (c >= 0x2B740 && c <= 0x2B81F) || (c >= 0x2B920 && c <= 0x2CEAF) ||
+           (c >= 0xF900 && c <= 0xFAFF) || (c >= 0x2F800 && c <= 0x2FA1F);
+}
+
+/* Base letter of the Latin Extended-A block (what NFD + mark stripping leaves), 0 = no decomposition. */
+static const struct { uint16_t lo, hi; char b; } WP_LATIN_A[] = {
+    {0x100, 0x105, 'a'}, {0x106, 0x10D, 'c'}, {0x10E, 0x10F, 'd'}, {0x112, 0x11B, 'e'}, {0x11C, 0x123, 'g'},
+    {0x124, 0x125, 'h'}, {0x128, 0x130, 'i'}, {0x134, 0x135, 'j'}, {0x136, 0x137, 'k'}, {0x139, 0x13E, 'l'},
+    {0x143, 0x148, 'n'}, {0x14C, 0x151, 'o'}, {0x154, 0x159, 'r'}, {0x15A, 0x161, 's'}, {0x162, 0x165, 't'},
+    {0x168, 0x173, 'u'}, {0x174, 0x175, 'w'}, {0x176, 0x178, 'y'}, {0x179, 0x17E, 'z'}};
+
+/* NFD base + lowercase of one code point; 0 for combining marks (dropped). */
+static uint32_t wp_fold(uint32_t c)
+{
+    if (c < 0x80) return (c >= 'A' && c <= 'Z') ? c + 32 : c;
+    if (wp_is_mark(c)) return 0;
+    if (c < 0x100) {
+        if (c >= 0xC0 && c <= 0xC5) return 'a';
+        if (c >= 0xE0 && c <= 0xE5) return 'a';
+        if (c == 0xC7 || c == 0xE7) return 'c';
+        if ((c >= 0xC8 && c <= 0xCB) || (c >= 0xE8 && c <= 0xEB)) return 'e';
+        if ((c >= 0xCC && c <= 0xCF) || (c >= 0xEC && c <= 0xEF)) return 'i';
+        if (c == 0xD1 || c == 0xF1) return 'n';
+        if ((c >= 0xD2 && c <= 0xD6) || (c >= 0xF2 && c <= 0xF6)) return 'o';
+        if ((c >= 0xD9 && c <= 0xDC) || (c >= 0xF9 && c <= 0xFC)) return 'u';
+        if (c == 0xDD || c == 0xFD || c == 0xFF) return 'y';
+        if (c == 0xC6 || c == 0xD0 || c == 0xD8 || c == 0xDE) return c + 32;
+        return c;
+    }
+    if (c < 0x180) {
+        for (size_t i = 0; i < sizeof(WP_LATIN_A) / sizeof(WP_LATIN_A[0]); i++)
+            if (c >= WP_LATIN_A[i].lo && c <= WP_LATIN_A[i].hi) return (uint32_t)WP_LATIN_A[i].b;
+        if ((c <= 0x137 || (c >= 0x14A && c <= 0x177)) && (c % 2) == 0) return c + 1;
+        if (c >= 0x139 && c <= 0x148 && (c % 2) == 1) return c + 1;
+        return c;
+    }
+    if (c >= 0x386 && c <= 0x3CE) {                      /* Greek: tonos/dialytika stripped, then lowercase */
+        switch (c) {
+        case 0x386: case 0x3AC: return 0x3B1;
+        case 0x388: case 0x3AD: return 0x3B5;
+        case 0x389: case 0x3AE: return 0x3B7;
+        case 0x38A: case 0x3AF: case 0x3AA: case 0x3CA: return 0x3B9;
+        case 0x38C: case 0x3CC: return 0x3BF;
+        case 0x38E: case 0x3CD: case 0x3AB: case 0x3CB: return 0x3C5;
+        case 0x38F: case 0x3CE: return 0x3C9;
+        default: return (c >= 0x391 && c <= 0x3A9 && c != 0x3A2) ? c + 32 : c;
+        }
+    }
+    if (c >= 0x400 && c <= 0x45F) {                      /* Cyrillic */
+        if (c == 0x419 || c == 0x439) return 0x438;
+        if (c == 0x401 || c == 0x451) return 0x435;
+        if (c >= 0x410 && c <= 0x42F) return c + 32;
+        if (c >= 0x400 && c <= 0x40F) return c + 80;
+    }
+    return c;
+}
+
+static int wpm_tokenize(const eif_bert_vocab_t *v, const char *text, int32_t *out, int max_tokens)
+{
+    const unsigned char *p = (const unsigned char *)text, *end = p + strlen(text);
+    size_t n = (size_t)(end - p);
+    char *words = (char *)malloc(n * 4 + 8);              /* NUL-separated words */
+    if (!words) return -1;
+    size_t m = 0, wstart = 0;
+    int n_out = 0;
+    out[n_out++] = (v->cls_id >= 0) ? v->cls_id : 0;
+    int unk = (v->unk_id >= 0) ? v->unk_id : 3;
+    int prefix = v->is_spm_prefix;
+    /* build words, then match them */
+    while (p < end) {
+        uint32_t c;
+        p += wp_decode(p, end, &c);
+        if (wp_is_space(c)) { if (m > wstart) { words[m++] = 0; wstart = m; } continue; }
+        if (c == 0 || c == 0xFFFD || c < 32 || (c >= 0x7F && c < 0xA0)) continue;
+        uint32_t f = wp_fold(c);
+        if (f == 0) continue;
+        if (wp_is_punct(c) || wp_is_cjk(c)) {
+            if (m > wstart) { words[m++] = 0; wstart = m; }
+            m += (size_t)wp_encode(f, words + m); words[m++] = 0; wstart = m;
+        } else m += (size_t)wp_encode(f, words + m);
+    }
+    if (m > wstart) words[m++] = 0;
+    for (size_t w = 0; w < m && n_out < max_tokens - 1;) {
+        const char *word = words + w;
+        size_t wl = strlen(word);
+        w += wl + 1;
+        char buf[320];
+        char *w1 = buf;
+        size_t n1;
+        if (prefix) { memcpy(buf, "\xE2\x96\x81", 3); n1 = wl < 300 ? wl : 300; memcpy(buf + 3, word, n1); n1 += 3; }
+        else { n1 = wl < 300 ? wl : 300; memcpy(buf, word, n1); }
+        int start_out = n_out, ok = 1;
+        for (size_t i = 0; i < n1 && ok; i++) {
+            int match = 0;
+            size_t jmax = n1 < i + 128 ? n1 : i + 128;
+            for (size_t j = jmax; j > i; j--) {
+                char sub[400];
+                size_t sl = j - i;
+                if (!prefix && i > 0) { memcpy(sub, "##", 2); memcpy(sub + 2, w1 + i, sl); sub[sl + 2] = 0; }
+                else { memcpy(sub, w1 + i, sl); sub[sl] = 0; }
+                int id = ebert_find_token(v, sub);
+                if (id >= 0 && n_out < max_tokens - 1) { out[n_out++] = id; i = j - 1; match = 1; break; }
+            }
+            if (!match) { n_out = start_out; ok = 0; }
+        }
+        if (n_out == start_out && n_out < max_tokens - 1) out[n_out++] = unk;
+    }
+    free(words);
+    out[n_out++] = (v->sep_id >= 0) ? v->sep_id : 2;
+    return n_out;
+}
+
 int eif_bert_tokenize(const eif_bert_t *bert, const char *text, int32_t *out_tokens, int max_tokens)
 {
     if (!bert || !text || !out_tokens || max_tokens < 3) return -1;
     const eif_bert_vocab_t *v = &bert->vocab;
+
+    if (v->byte_bpe) return byte_bpe_tokenize(v, text, out_tokens, max_tokens);
 
     if (v->tok_type == EBERT_TOKENIZER_BPE) {
         int bos = (v->cls_id >= 0) ? 1 : 0;
@@ -391,6 +591,8 @@ int eif_bert_tokenize(const eif_bert_t *bert, const char *text, int32_t *out_tok
     if (v->tok_type == EBERT_TOKENIZER_SPM && v->bpe_merges) return gemma4_bpe_tokenize(v, text, out_tokens, max_tokens);
     if (v->tok_type == EBERT_TOKENIZER_SPM && v->unigram) return ugm_tokenize(v, text, out_tokens, max_tokens);
     if (v->tok_type == EBERT_TOKENIZER_SPM && v->spm_bigram) return spm_tokenize(v, text, out_tokens, max_tokens);
+
+    if (v->lowercase && v->tok_type != EBERT_TOKENIZER_BPE) return wpm_tokenize(v, text, out_tokens, max_tokens);
 
     if (v->tok_type == EBERT_TOKENIZER_SPM) {
         int n_out = 0;

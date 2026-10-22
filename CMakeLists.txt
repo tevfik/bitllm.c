@@ -54,6 +54,7 @@ set(BITLLM_SOURCES
     src/eif_bert.c
     src/eif_bert_kernels.c
     src/eif_bert_gemma.c
+    src/eif_bert_modern.c
     src/eif_bert_tokenizer.c
     src/eif_gpu.c
     src/eif_gemm.c

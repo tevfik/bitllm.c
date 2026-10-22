@@ -119,7 +119,7 @@ static int bert_setup_vocab_and_scratch(eif_bert_t *bert)
     bert->scratch_v      = (float *)malloc((size_t)max_t * dim_a * sizeof(float));
     bert->scratch_att    = (float *)malloc((size_t)bert->config.n_heads * max_t * max_t * sizeof(float));
     /* Gated FFN (GEGLU) needs a second [T x inter] buffer for the gate branch */
-    size_t inter_mult = bert->weights.ffn_gate_w ? 2 : 1;
+    size_t inter_mult = bert->config.arch_modern ? 3 : (bert->weights.ffn_gate_w ? 2 : 1); /* modern: fused up [2 ff] + gated result [ff] */
     bert->scratch_inter  = (float *)malloc((size_t)max_t * inter_dim * inter_mult * sizeof(float));
     bert->scratch_proj   = (float *)malloc((size_t)max_t * proj_dim * sizeof(float));
     if (bert->config.n_embd_per_layer > 0) {
@@ -192,7 +192,8 @@ static int eif_bert_load_gguf(eif_bert_t *bert, const uint8_t *addr, size_t file
     int n_kv_heads = 0, n_embd_pl = 0, dim_out = 0;
     float rope_freq = 0.0f, rope_freq_swa = 0.0f, rms_eps = 0.0f;
     int sliding_window = 0;
-    int tok_model_bert = 0, tok_model_known = 0, tok_model_unigram = 0, tok_model_spm = 0, tok_model_gemma4 = 0, add_space_prefix = 1;
+    int tok_model_bert = 0, tok_model_known = 0, tok_model_unigram = 0, tok_model_spm = 0, tok_model_gemma4 = 0, add_space_prefix = 1, pre_kind = 0, tok_model_gpt2 = 0, swa_pattern = 0;
+    char hidden_act[16] = "";
     char arch_name[64] = {0};
 
     for (uint64_t i = 0; i < n_kv; i++) {
@@ -210,7 +211,16 @@ static int eif_bert_load_gguf(eif_bert_t *bert, const uint8_t *addr, size_t file
             tok_model_unigram = (strcmp(tm, "t5") == 0);
             tok_model_spm = (strcmp(tm, "llama") == 0 || strcmp(tm, "gemma4") == 0);
             tok_model_gemma4 = (strcmp(tm, "gemma4") == 0);
+            tok_model_gpt2 = (strcmp(tm, "gpt2") == 0);
             tok_model_known = 1;
+        } else if (strcmp(key, "tokenizer.ggml.pre") == 0 && vtype == 8) {
+            char pre[64];
+            gguf_read_str(&p, pre, sizeof(pre));
+            pre_kind = strcmp(pre, "granite-embed-multi-97m") == 0 ? 2 : (strcmp(pre, "roberta-bpe") == 0 || strcmp(pre, "gpt-2") == 0 || strcmp(pre, "jina-v2-code") == 0 || strcmp(pre, "jina-v2-de") == 0 || strcmp(pre, "jina-v2-es") == 0 || strcmp(pre, "default") == 0) ? 1 : 0;
+        } else if (strstr(key, "attention.sliding_window_pattern") && vtype == 4) {
+            swa_pattern = (int)gguf_read_u32(&p);
+        } else if (strstr(key, ".hidden_activation") && vtype == 8) {
+            gguf_read_str(&p, hidden_act, sizeof(hidden_act));
         } else if (strcmp(key, "general.alignment") == 0) {
             alignment = gguf_read_u32(&p);
         } else if (strstr(key, ".embedding_length") && strcmp(strstr(key, ".embedding_length"), ".embedding_length") == 0 && vtype == 4) {
@@ -348,7 +358,8 @@ static int eif_bert_load_gguf(eif_bert_t *bert, const uint8_t *addr, size_t file
     bert->vocab.unigram = tok_model_unigram && bert->vocab.scores != NULL;
     bert->vocab.spm_bigram = tok_model_spm && bert->vocab.scores != NULL && !(tok_model_gemma4 && bert->vocab.n_merges > 0);
     bert->vocab.bpe_merges = tok_model_gemma4 && bert->vocab.n_merges > 0;
-    if (bert->vocab.bpe_merges && ebert_build_merge_table(&bert->vocab) != 0) return -8;
+    bert->vocab.byte_bpe = (tok_model_gpt2 && bert->vocab.n_merges > 0) ? pre_kind : 0;
+    if ((bert->vocab.bpe_merges || bert->vocab.byte_bpe) && ebert_build_merge_table(&bert->vocab) != 0) return -8;
     bert->vocab.add_space_prefix = add_space_prefix != 0;
     bert->vocab.lowercase = tok_model_known ? (tok_model_bert != 0) : true;
     { const char *kc = getenv("EIF_SPM_KEEP_CASE"); if (kc && kc[0] == '1') bert->vocab.lowercase = false; }
@@ -359,6 +370,9 @@ static int eif_bert_load_gguf(eif_bert_t *bert, const uint8_t *addr, size_t file
     bert->config.use_rope = false;
     bert->config.ffn_silu = false;
     if (strcmp(arch_name, "nomic-bert") == 0) { bert->config.use_rope = true; bert->config.ffn_silu = true; }
+    bert->config.arch_modern = strcmp(arch_name, "modern-bert") == 0;
+    bert->config.swa_pattern = swa_pattern > 0 ? swa_pattern : 3;
+    if (bert->config.arch_modern) bert->config.ffn_silu = strcmp(hidden_act, "silu") == 0;
     bert->config.emb_scale = 0.0f;
     bert->config.attn_scale = 0.0f;
     bert->config.n_embd_per_layer = 0;
@@ -461,7 +475,7 @@ static int eif_bert_load_gguf(eif_bert_t *bert, const uint8_t *addr, size_t file
     if (raw_pos == NULL) {
         /* RoPE models (gemma-embedding) have no absolute position table on
          * purpose — they use rotary embeddings, not ALiBi. */
-        if (bert->config.norm_style == 0 && !bert->config.use_rope) bert->config.use_alibi = true;
+        if (bert->config.norm_style == 0 && !bert->config.use_rope && !bert->config.arch_modern) bert->config.use_alibi = true;
     }
     bert->weights.type_emb   = (const float *)find_gguf_tensor(tdescs, (int)n_tensors, data_start, "token_types.weight", NULL);
     bert->weights.type_rows  = 1;
@@ -602,7 +616,7 @@ static int eif_bert_load_gguf(eif_bert_t *bert, const uint8_t *addr, size_t file
     /* Fused attn_qkv (nomic-bert): rows [0,dim) are Q, [dim,2dim) K, [2dim,3dim) V, so the three projections
      * are plain row offsets into the same tensor (Q8_0 / F32 only, the layouts bert_gemm reads). */
     for (int l = 0; l < n_layers; l++) {
-        if (bert->weights.q_w[l] || !bert->config.use_rope) continue; /* only nomic-bert's layout is known; modern-bert differs */
+        if (bert->weights.q_w[l] || !(bert->config.use_rope || bert->config.arch_modern)) continue; /* the two fused layouts we know */
         uint32_t ft = 0;
         snprintf(tname, sizeof(tname), "blk.%d.attn_qkv.weight", l);
         const uint8_t *f = (const uint8_t *)find_gguf_tensor(tdescs, (int)n_tensors, data_start, tname, &ft);
@@ -622,6 +636,31 @@ static int eif_bert_load_gguf(eif_bert_t *bert, const uint8_t *addr, size_t file
             !bert->weights.ffn_up_w[l] || !bert->weights.ffn_down_w[l]) {
             fprintf(stderr, "eif_bert: architecture '%s' is not supported: layer %d lacks separate attn_q/k/v/output or ffn_up/down tensors "
                             "(unsupported fused layout)\n", arch_name, l);
+            free(tdescs);
+            return -9;
+        }
+    }
+
+    /* ModernBERT: pre-norm weights (layer 0 has no attention norm) and the final norm */
+    if (bert->config.arch_modern) {
+        bert->weights.pre_attn_norm_w = (const float **)calloc((size_t)n_layers, sizeof(float *));
+        bert->weights.pre_ffn_norm_w  = (const float **)calloc((size_t)n_layers, sizeof(float *));
+        if (!bert->weights.pre_attn_norm_w || !bert->weights.pre_ffn_norm_w) { free(tdescs); return -8; }
+        for (int l = 0; l < n_layers; l++) {
+            snprintf(tname, sizeof(tname), "blk.%d.attn_norm.weight", l);
+            bert->weights.pre_attn_norm_w[l] = (const float *)find_gguf_tensor(tdescs, (int)n_tensors, data_start, tname, NULL);
+            snprintf(tname, sizeof(tname), "blk.%d.ffn_norm.weight", l);
+            bert->weights.pre_ffn_norm_w[l] = (const float *)find_gguf_tensor(tdescs, (int)n_tensors, data_start, tname, NULL);
+            if (!bert->weights.pre_ffn_norm_w[l] || (l > 0 && !bert->weights.pre_attn_norm_w[l])) {
+                fprintf(stderr, "eif_bert: modern-bert layer %d lacks its norm weights\n", l);
+                free(tdescs);
+                return -9;
+            }
+        }
+        bert->weights.output_norm_w = (const float *)find_gguf_tensor(tdescs, (int)n_tensors, data_start, "output_norm.weight", NULL);
+        if (!bert->weights.output_norm_w || !bert->weights.emb_norm_w || bert->config.qtype != 2 ||
+            bert->weights.token_emb == NULL) {
+            fprintf(stderr, "eif_bert: modern-bert needs token_embd_norm, output_norm and Q8_0 weights\n");
             free(tdescs);
             return -9;
         }
@@ -1076,6 +1115,8 @@ void eif_bert_free(eif_bert_t *bert)
     if (bert->scratch_attout) free(bert->scratch_attout);
     if (bert->weights.cls_w_owned) free(bert->weights.cls_w_owned);
     if (bert->weights.g2_pl_model_proj) free((void *)bert->weights.g2_pl_model_proj);
+    free((void *)bert->weights.pre_attn_norm_w); free((void *)bert->weights.attn_post_norm_w);
+    free((void *)bert->weights.pre_ffn_norm_w); free((void *)bert->weights.post_ffw_norm_w);
     if (bert->weights.g2_inp_gate) free((void *)bert->weights.g2_inp_gate);
     if (bert->weights.g2_proj) free((void *)bert->weights.g2_proj);
     if (bert->weights.g2_post_norm) free((void *)bert->weights.g2_post_norm);
@@ -1102,6 +1143,7 @@ void eif_bert_free(eif_bert_t *bert)
  * bert->scratch_seq_x [T x dim]. Shared by embedding (pooling) and ranking (CLS head). */
 static int bert_forward(eif_bert_t *bert, const int32_t *tokens, const uint8_t *type_ids, int T)
 {
+    if (bert->config.arch_modern) return eif_bert_forward_modern(bert, tokens, T);
     int dim = bert->config.dim;
     int inter_dim = bert->config.intermediate_dim;
     int n_layers = bert->config.n_layers;

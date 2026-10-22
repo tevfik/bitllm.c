@@ -108,6 +108,9 @@ void bert_rope_neox(float *x, int pos, int hd, float freq_base);
 /* eif_bert.c */
 int bert_token_cap(const eif_bert_t *bert);
 
+/* eif_bert_modern.c */
+int eif_bert_forward_modern(eif_bert_t *bert, const int32_t *tokens, int T);
+
 /* eif_bert_gemma.c: Gemma-embedding encoders (norm_style 1) */
 int eif_bert_embed_gemma(eif_bert_t *bert, const char *text, float *out_embedding);
 int eif_bert_embed_gemma2(eif_bert_t *bert, const char *text, float *out_embedding);

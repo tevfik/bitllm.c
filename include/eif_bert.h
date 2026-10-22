@@ -38,6 +38,8 @@ typedef struct {
     int max_seq_len;      /**< Maximum sequence context length (e.g. 512) */
     int vocab_size;       /**< Vocabulary size (e.g. 30522) */
     int qtype;            /**< 0=FP32, 1=INT8 EIFM separated, 2=INT8 GGUF interleaved */
+    bool arch_modern;     /**< ModernBERT: pre-norm, fused GLU FFN, local/global attention with two RoPE bases */
+    int swa_pattern;      /**< ModernBERT: every swa_pattern-th layer (starting at 0) is global, the rest are local */
     bool use_rope;        /**< rotary Q/K (NeoX half-split) instead of absolute positions/ALiBi (nomic-bert) */
     bool ffn_silu;        /**< gated FFN activation is SiLU (SwiGLU) instead of GELU (GEGLU) */
     bool use_alibi;       /**< Attention with Linear Biases (e.g. Jina Embeddings v2) */
@@ -169,6 +171,7 @@ typedef struct {
     bool bpe_merges;        /**< Gemma4-style SPM BPE (merge ranks over raw UTF-8, spaces escaped to U+2581) */
     bool spm_bigram;     /**< llama.cpp SentencePiece merge tokenisation (tokenizer.ggml.model == "llama") */
     bool add_space_prefix; /**< prepend U+2581 to the first word (tokenizer.ggml.add_space_prefix) */
+    int byte_bpe;         /**< byte-level BPE by merge rank: 0 off, 1 GPT-2 pre-tokenizer, 2 Granite multilingual (+ignore_merges) */
     bool unigram;        /**< Viterbi Unigram tokenisation (tokenizer.ggml.model == "t5") */
     bool lowercase;      /**< lowercase input before WordPiece lookup (uncased BERT vocab) */
     eif_bert_tokenizer_type_t tok_type;

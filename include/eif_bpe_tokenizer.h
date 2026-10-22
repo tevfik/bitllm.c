@@ -96,6 +96,13 @@ const char *eif_bpe_tokenizer_decode(const eif_bpe_tokenizer_t *tok, int32_t tok
  */
 void eif_bpe_tokenizer_free(eif_bpe_tokenizer_t *tok);
 
+/** Length of the next GPT-2 / RoBERTa pre-token at p (p < end). */
+size_t eif_pretoken_len_gpt2(const char *p, const char *end);
+/** Length of the next Granite-multilingual pre-token at p (p < end). */
+size_t eif_pretoken_len_granite(const char *p, const char *end);
+/** GPT-2 byte-to-unicode table entry (NUL-terminated UTF-8, 1-2 bytes). */
+const char *eif_bpe_byte_to_unicode(uint8_t b);
+
 #ifdef __cplusplus
 }
 #endif

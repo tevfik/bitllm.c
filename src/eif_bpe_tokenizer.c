@@ -291,7 +291,7 @@ static size_t pretoken_len(const char *p, const char *end)
 /* GPT-2 / RoBERTa pre-tokenizer (what llama.cpp uses for jina-v2-code and plain gpt2 vocabularies):
  *   's|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+
  * Differs from the Qwen split above: digits group, whitespace runs keep all but the last blank. */
-static size_t pretoken_len_gpt2(const char *p, const char *end)
+size_t eif_pretoken_len_gpt2(const char *p, const char *end)
 {
     uint32_t c0;
     int l0;
@@ -329,6 +329,113 @@ static size_t pretoken_len_gpt2(const char *p, const char *end)
         return (size_t)(e - p);
     }
     return (size_t)l0;
+}
+
+/* Granite multilingual embedding pre-tokenizer (llama.cpp LLAMA_VOCAB_PRE_TYPE_GRANITE_EMB_MULTI):
+ *   [^\r\n\p{L}\p{N}]?((?=[\p{L}\p{M}])[^a-z])*((?=[\p{L}\p{M}])[^A-Z])+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?
+ *  |[^\r\n\p{L}\p{N}]?((?=[\p{L}\p{M}])[^a-z])+((?=[\p{L}\p{M}])[^A-Z])*(?:'...)?
+ *  |\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+
+ * "Upper" letters are letters/marks outside a-z, "lower" letters those outside A-Z (non-ASCII letters are both). */
+static bool gr_letter(cp_class_t k) { return k == CP_LETTER || k == CP_MARK; }
+
+static size_t gr_contraction(const char *q, const char *end)
+{
+    if (q >= end || *q != '\'' || q + 1 >= end) return 0;
+    char a = (char)(q[1] | 0x20);
+    if (a == 's' || a == 't' || a == 'm' || a == 'd') return 2;
+    if (q + 2 < end) {
+        char b = (char)(q[2] | 0x20);
+        if ((a == 'r' && b == 'e') || (a == 'v' && b == 'e') || (a == 'l' && b == 'l')) return 3;
+    }
+    return 0;
+}
+
+/* Word alternatives 1 and 2 starting at s (after the optional lead); 0 when neither matches. */
+static size_t gr_word(const char *s, const char *end)
+{
+    uint32_t c; int l;
+    const char *q = s;
+    int u_max = 0;
+    while (q < end) {                                   /* leading "upper" letters */
+        cp_class_t k = class_at(q, end, &l, &c);
+        if (!gr_letter(k) || (c >= 'a' && c <= 'z')) break;
+        u_max++; q += l;
+    }
+    const char *after_u = q;
+    int best = -1;
+    q = s;
+    for (int idx = 0; idx <= u_max && q < end; idx++) { /* alt 1: largest k <= u_max whose char is "lower" */
+        cp_class_t k = class_at(q, end, &l, &c);
+        if (!gr_letter(k)) break;
+        if (!(c >= 'A' && c <= 'Z')) best = idx;
+        q += l;
+    }
+    const char *e;
+    if (best >= 0) {
+        q = s;
+        for (int idx = 0; idx < best; idx++) { class_at(q, end, &l, &c); q += l; }
+        while (q < end) {                                /* L+ from char best */
+            cp_class_t k = class_at(q, end, &l, &c);
+            if (!gr_letter(k) || (c >= 'A' && c <= 'Z')) break;
+            q += l;
+        }
+        e = q;
+    } else if (u_max > 0) {
+        e = after_u;                                     /* alt 2: U+ with an empty L* */
+    } else {
+        return 0;
+    }
+    e += gr_contraction(e, end);
+    return (size_t)(e - s);
+}
+
+size_t eif_pretoken_len_granite(const char *p, const char *end)
+{
+    uint32_t c0; int l0;
+    cp_class_t k0 = class_at(p, end, &l0, &c0);
+    if (k0 != CP_LETTER && k0 != CP_NUMBER && c0 != '\r' && c0 != '\n') {
+        size_t w = gr_word(p + l0, end);
+        if (w) return (size_t)l0 + w;
+    }
+    {
+        size_t w = gr_word(p, end);
+        if (w) return w;
+    }
+    if (k0 == CP_NUMBER) {
+        const char *q = p; uint32_t c; int l, n = 0;
+        while (q < end && n < 3 && class_at(q, end, &l, &c) == CP_NUMBER) { q += l; n++; }
+        return (size_t)(q - p);
+    }
+    {
+        const char *q = (c0 == ' ') ? p + 1 : p;
+        const char *s0 = q;
+        uint32_t c; int l; cp_class_t k;
+        while (q < end && (k = class_at(q, end, &l, &c)) != CP_SPACE && k != CP_LETTER && k != CP_NUMBER) q += l;
+        if (q > s0) {
+            while (q < end && (*q == '\r' || *q == '\n' || *q == '/')) q++;
+            return (size_t)(q - p);
+        }
+    }
+    if (k0 == CP_SPACE) {
+        const char *q = p, *last_nl_end = NULL, *prev = p;
+        uint32_t c; int l;
+        while (q < end && class_at(q, end, &l, &c) == CP_SPACE) {
+            prev = q; q += l;
+            if (c == '\r' || c == '\n') last_nl_end = q;
+        }
+        if (last_nl_end) return (size_t)(last_nl_end - p);
+        if (q >= end) return (size_t)(q - p);
+        if (prev > p) return (size_t)(prev - p);
+        return (size_t)(q - p);
+    }
+    return (size_t)l0;
+}
+
+/* GPT-2 byte -> printable UTF-8 character (the table used by every byte-level BPE vocabulary). */
+const char *eif_bpe_byte_to_unicode(uint8_t b)
+{
+    init_b2u_table();
+    return g_b2u[b];
 }
 
 static void bpe_merge_range(const eif_bpe_tokenizer_t *tok, int32_t *work, int start, int *n_tokens,
@@ -432,7 +539,7 @@ int eif_bpe_tokenizer_encode(const eif_bpe_tokenizer_t *tok, const char *text,
         if (tok->is_byte_bpe) {
             /* Pre-tokenize, then byte-map and merge each chunk independently */
             const char *end = text + text_len;
-            size_t plen = tok->pretok_gpt2 ? pretoken_len_gpt2(c, end) : pretoken_len(c, end);
+            size_t plen = tok->pretok_gpt2 ? eif_pretoken_len_gpt2(c, end) : pretoken_len(c, end);
             /* stop the chunk at the next special tag so it is handled by the check above */
             for (size_t k = 1; k < plen; k++) {
                 if (c[k] != '<') continue;

@@ -14,7 +14,9 @@ SHORT = ["The quick brown fox jumps over the lazy dog.",
          "A fast brown fox leaps over a sleepy dog.",
          "Quarterly revenue grew by twelve percent in the European market.",
          "dog lazy the over jumps fox brown quick The.",
-         "def add(a, b):\n    return a + b"]
+         "def add(a, b):\n    return a + b",
+         "Türkiye'nin başkenti Ankara'dır; İstanbul çok büyük bir şehirdir. Ünlü şair Yunus Emre'yi okudum.",
+         "日本語のテキストを埋め込みます。Café naïve résumé 123456 !!! 東京タワー"]
 BASE = ["The committee reviewed the annual budget and approved several infrastructure projects across the region.",
         "Engineers measured the vibration of the bridge under heavy traffic and recorded the results in a report.",
         "A small bakery on the corner of the street sells fresh bread, croissants and coffee every morning.",
