@@ -197,6 +197,20 @@ static inline float gelu_f32(float x)
     return 0.5f * x * (1.0f + tanhf(0.79788456f * (x + 0.044715f * x * x * x)));
 }
 
+/* Exact GELU (erf form) — gemma-embedding uses LLM_FFN_GELU in llama.cpp */
+static inline float gelu_erf_f32(float x)
+{
+    return 0.5f * x * (1.0f + erff(x * 0.70710678118654752f));
+}
+
+static void bert_gelu_exact(float *out, const float *in, int n)
+{
+#pragma omp parallel for schedule(static) if(n >= 1024)
+    for (int i = 0; i < n; i++) {
+        out[i] = gelu_erf_f32(in[i]);
+    }
+}
+
 static void bert_gelu(float *out, const float *in, int n)
 {
 #pragma omp parallel for schedule(static) if(n >= 1024)
@@ -2286,14 +2300,34 @@ static void gemma_head_rmsnorm(float *p, const float *w /* head slice */, int hd
 
 static void gemma_rope(float *x, int pos, int hd, float freq_base)
 {
-    for (int i = 0; i < hd; i += 2) {
-        float freq = powf(freq_base, -(float)i / (float)hd);
+    static int disable = -1;
+    if (disable < 0) disable = getenv("EIF_NO_ROPE") ? 1 : 0;
+    if (disable || pos == 0) return;
+    /* NEOX style (gemma/every LLM rope in llama.cpp): rotate half-split pairs.
+     * Pair (x[i], x[hd/2 + i]), freq = base^(-2i/hd) — NOT interleaved pairs. */
+    int half = hd / 2;
+    for (int i = 0; i < half; i++) {
+        float freq = powf(freq_base, -2.0f * (float)i / (float)hd);
         float ang = (float)pos * freq;
         float c = cosf(ang), s = sinf(ang);
-        float x0 = x[i], x1 = x[i + 1];
-        x[i]     = x0 * c - x1 * s;
-        x[i + 1] = x0 * s + x1 * c;
+        float x0 = x[i], x1 = x[half + i];
+        x[i]        = x0 * c - x1 * s;
+        x[half + i] = x0 * s + x1 * c;
     }
+}
+
+static void gemma_dump_tensor(const char *name, const float *data, int dim, int T)
+{
+    const char *dir = getenv("EIF_DUMP_DIR");
+    if (!dir) return;
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/%s.bin", dir, name);
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    int64_t ne[4] = { dim, T, 1, 1 };
+    fwrite(ne, sizeof(ne), 1, f);
+    fwrite(data, sizeof(float), (size_t)dim * T, f);
+    fclose(f);
 }
 
 static int eif_bert_embed_gemma(eif_bert_t *bert, const char *text, float *out_embedding)
@@ -2301,9 +2335,11 @@ static int eif_bert_embed_gemma(eif_bert_t *bert, const char *text, float *out_e
     if (!bert || !bert->is_initialized || !text || !out_embedding) return -1;
 
     int max_tokens = bert->config.max_seq_len;
-    int32_t tokens[512];
-    int T = eif_bert_tokenize(bert, text, tokens, (max_tokens > 512) ? 512 : max_tokens);
-    if (T <= 0) return -2;
+    if (max_tokens <= 0 || max_tokens > 8192) max_tokens = 2048;
+    int32_t *tokens = (int32_t *)malloc((size_t)max_tokens * sizeof(int32_t));
+    if (!tokens) return -1;
+    int T = eif_bert_tokenize(bert, text, tokens, max_tokens);
+    if (T <= 0) { free(tokens); return -2; }
 
     int dim = bert->config.dim;
     int inter_dim = bert->config.intermediate_dim;
@@ -2329,8 +2365,10 @@ static int eif_bert_embed_gemma(eif_bert_t *bert, const char *text, float *out_e
     float *PROJ = bert->scratch_proj;
 
     if (!bert->weights.pre_attn_norm_w || !bert->weights.attn_post_norm_w ||
-        !bert->weights.pre_ffn_norm_w || !bert->weights.post_ffw_norm_w || !bert->weights.ffn_gate_w)
+        !bert->weights.pre_ffn_norm_w || !bert->weights.post_ffw_norm_w || !bert->weights.ffn_gate_w) {
+        free(tokens);
         return -3;
+    }
 
     /* Embedding layer: dequant + optional scale + RMS*(1+w) */
     for (int t = 0; t < T; t++) {
@@ -2356,30 +2394,53 @@ static int eif_bert_embed_gemma(eif_bert_t *bert, const char *text, float *out_e
         for (int t = 0; t < T; t++)
             gemma_rmsnorm(X + t * dim, X + t * dim, bert->weights.emb_norm_w, dim, eps);
     }
+    gemma_dump_tensor("inp_scaled", X, dim, T);
 
     int kv_group = n_heads / n_kv;
 
-    for (int l = 0; l < n_layers; l++) {
-        gemma_rmsnorm(XB, X, bert->weights.pre_attn_norm_w[l], dim, eps);
+    /* gemma3-style layered rope: layers il%6==5 are GLOBAL (dense/full attn, global theta);
+     * the rest are SWA layers with their own (usually smaller) theta. llama.cpp:
+     * is_swa(il) ? rope_freq_base_train_swa : rope.freq_base; default swa base = 10000. */
+    float freq_base_swa = 10000.0f;
 
-        bert_gemm(Q, bert->weights.q_w[l], NULL, XB, NULL, T, dim, dim, qtype);
-        bert_gemm(K, bert->weights.k_w[l], NULL, XB, NULL, T, kv_dim, dim, qtype);
-        bert_gemm(V, bert->weights.v_w[l], NULL, XB, NULL, T, kv_dim, dim, qtype);
+    for (int l = 0; l < n_layers; l++) {
+        for (int t = 0; t < T; t++)
+            gemma_rmsnorm(XB + (size_t)t * dim, X + (size_t)t * dim, bert->weights.pre_attn_norm_w[l], dim, eps);
+
+        bert_gemm(Q, bert->weights.q_w[l],
+                  bert->weights.q_w_scales ? bert->weights.q_w_scales[l] : NULL, XB,
+                  bert->weights.q_b ? bert->weights.q_b[l] : NULL, T, dim, dim, qtype);
+        bert_gemm(K, bert->weights.k_w[l],
+                  bert->weights.k_w_scales ? bert->weights.k_w_scales[l] : NULL, XB,
+                  bert->weights.k_b ? bert->weights.k_b[l] : NULL, T, kv_dim, dim, qtype);
+        bert_gemm(V, bert->weights.v_w[l],
+                  bert->weights.v_w_scales ? bert->weights.v_w_scales[l] : NULL, XB,
+                  bert->weights.v_b ? bert->weights.v_b[l] : NULL, T, kv_dim, dim, qtype);
 
         /* per-head QK RMS *(1+w), then RoPE */
         for (int t = 0; t < T; t++) {
             for (int h = 0; h < n_heads; h++) {
                 float *qc = Q + (size_t)t * dim + (size_t)h * head_dim;
                 if (bert->weights.q_norm_w[l])
-                    gemma_head_rmsnorm(qc, bert->weights.q_norm_w[l] + (size_t)h * head_dim, head_dim, eps);
-                gemma_rope(qc, t, head_dim, freq_base);
+                    gemma_head_rmsnorm(qc, bert->weights.q_norm_w[l], head_dim, eps);
             }
             for (int kvh = 0; kvh < n_kv; kvh++) {
                 float *kc = K + (size_t)t * kv_dim + (size_t)kvh * head_dim;
                 if (bert->weights.k_norm_w[l])
-                    gemma_head_rmsnorm(kc, bert->weights.k_norm_w[l] + (size_t)kvh * head_dim, head_dim, eps);
-                gemma_rope(kc, t, head_dim, freq_base);
+                    gemma_head_rmsnorm(kc, bert->weights.k_norm_w[l], head_dim, eps);
             }
+        }
+        if (l == 0) gemma_dump_tensor("Qcur_normed-0", Q, dim, T);
+        for (int t = 0; t < T; t++) {
+            for (int h = 0; h < n_heads; h++)
+                gemma_rope(Q + (size_t)t * dim + (size_t)h * head_dim, t, head_dim, l % 6 == 5 ? freq_base : freq_base_swa);
+            for (int kvh = 0; kvh < n_kv; kvh++)
+                gemma_rope(K + (size_t)t * kv_dim + (size_t)kvh * head_dim, t, head_dim, l % 6 == 5 ? freq_base : freq_base_swa);
+        }
+        if (l == 0) {
+            gemma_dump_tensor("Qcur-0", Q, dim, T);
+            gemma_dump_tensor("Kcur-0", K, kv_dim, T);
+            gemma_dump_tensor("Vcur-0", V, kv_dim, T);
         }
 
         /* bidirectional full attention, KV heads shared across groups */
@@ -2452,26 +2513,37 @@ static int eif_bert_embed_gemma(eif_bert_t *bert, const char *text, float *out_e
 
         bert_gemm(PROJ, bert->weights.out_w[l], NULL, XB, NULL, T, dim, dim, qtype);
         /* post-attention norm on attn output, THEN residual (gemma sandwich) */
-        gemma_rmsnorm(PROJ, PROJ, bert->weights.attn_post_norm_w[l], dim, eps);
+        for (int t = 0; t < T; t++)
+            gemma_rmsnorm(PROJ + (size_t)t * dim, PROJ + (size_t)t * dim, bert->weights.attn_post_norm_w[l], dim, eps);
+        if (l == 0) gemma_dump_tensor("attn_post_norm-0", PROJ, dim, T);
         for (int i = 0; i < T * dim; i++) X[i] += PROJ[i];
+        if (l == 0) gemma_dump_tensor("sa_out-0", X, dim, T);
 
         /* GEGLU MLP: pre-FFN norm = ffn_norm; down( gelu(gate(x)) * up(x) ) */
-        gemma_rmsnorm(XB, X, bert->weights.pre_ffn_norm_w[l], dim, eps);
+        for (int t = 0; t < T; t++)
+            gemma_rmsnorm(XB + (size_t)t * dim, X + (size_t)t * dim, bert->weights.pre_ffn_norm_w[l], dim, eps);
+        if (l == 0) gemma_dump_tensor("ffn_norm-0", XB, dim, T);
         bert_gemm(H_INTER, bert->weights.ffn_up_w[l], NULL, XB, NULL, T, inter_dim, dim, qtype);
         float *H_GATE = H_INTER + (size_t)T * inter_dim;
         bert_gemm(H_GATE, bert->weights.ffn_gate_w[l], NULL, XB, NULL, T, inter_dim, dim, qtype);
-        bert_gelu(H_GATE, H_GATE, T * inter_dim);
+        /* gemma-embedding uses exact erf gelu (LLM_FFN_GELU), not tanh approx */
+        bert_gelu_exact(H_GATE, H_GATE, T * inter_dim);
         for (int i = 0; i < T * inter_dim; i++) H_INTER[i] *= H_GATE[i];
 
         bert_gemm(PROJ, bert->weights.ffn_down_w[l], NULL, H_INTER, NULL, T, dim, inter_dim, qtype);
-        gemma_rmsnorm(PROJ, PROJ, bert->weights.post_ffw_norm_w[l], dim, eps);
+        if (l == 0) gemma_dump_tensor("ffn_out-0", PROJ, dim, T);
+        for (int t = 0; t < T; t++)
+            gemma_rmsnorm(PROJ + (size_t)t * dim, PROJ + (size_t)t * dim, bert->weights.post_ffw_norm_w[l], dim, eps);
         for (int i = 0; i < T * dim; i++) X[i] += PROJ[i];
+        if (l == 0) gemma_dump_tensor("l_out-0", X, dim, T);
+        if (l == 1) gemma_dump_tensor("l_out-1", X, dim, T);
     }
 
     if (bert->weights.output_norm_w) {
         for (int t = 0; t < T; t++)
             gemma_rmsnorm(X + t * dim, X + t * dim, bert->weights.output_norm_w, dim, eps);
     }
+    gemma_dump_tensor("result_norm", X, dim, T);
 
     /* Mean pooling (EmbeddingGemma uses mean over tokens) */
     memset(out_embedding, 0, (size_t)dim * sizeof(float));
@@ -2480,7 +2552,15 @@ static int eif_bert_embed_gemma(eif_bert_t *bert, const char *text, float *out_e
         for (int d = 0; d < dim; d++) out_embedding[d] += x_t[d];
     }
     float inv_T = 1.0f / (float)T;
-    for (int d = 0; d < dim; d++) out_embedding[d] *= inv_T;
+    float ss = 0.0f;
+    for (int d = 0; d < dim; d++) {
+        out_embedding[d] *= inv_T;
+        ss += out_embedding[d] * out_embedding[d];
+    }
+    /* L2-normalize: same contract as llama.cpp's llama-embedding (unit vectors) */
+    float inv_norm = ss > 1e-24f ? 1.0f / sqrtf(ss) : 0.0f;
+    for (int d = 0; d < dim; d++) out_embedding[d] *= inv_norm;
+    free(tokens);
     return 0;
 }
 
