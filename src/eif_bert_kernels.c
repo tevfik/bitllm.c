@@ -1050,6 +1050,9 @@ static void bert_gemm_int8_gguf(
                 const float *xs2 = xs + (size_t)(t + 2) * blocks_per_row;
                 const float *xs3 = xs + (size_t)(t + 3) * blocks_per_row;
                 float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+#if defined(EIF_ARCH_ARM64)
+                float32x4_t va0 = vdupq_n_f32(0.0f), va1 = va0, va2 = va0, va3 = va0;
+#endif
 
                 for (int b_idx = 0; b_idx < blocks_per_row; b_idx++) {
                     const uint8_t *blk = w_row + (size_t)b_idx * 34;
@@ -1058,15 +1061,10 @@ static void bert_gemm_int8_gguf(
                     size_t off = (size_t)b_idx * 32;
 
 #if defined(EIF_ARCH_ARM64)
-                    int32_t s0 = arm_dot32(wb, xq0 + off);
-                    int32_t s1 = arm_dot32(wb, xq1 + off);
-                    int32_t s2 = arm_dot32(wb, xq2 + off);
-                    int32_t s3 = arm_dot32(wb, xq3 + off);
-
-                    acc0 += (float)s0 * (w_scale * xs0[b_idx]);
-                    acc1 += (float)s1 * (w_scale * xs1[b_idx]);
-                    acc2 += (float)s2 * (w_scale * xs2[b_idx]);
-                    acc3 += (float)s3 * (w_scale * xs3[b_idx]);
+                    va0 = vfmaq_n_f32(va0, vcvtq_f32_s32(arm_dot32_v(wb, xq0 + off)), w_scale * xs0[b_idx]);
+                    va1 = vfmaq_n_f32(va1, vcvtq_f32_s32(arm_dot32_v(wb, xq1 + off)), w_scale * xs1[b_idx]);
+                    va2 = vfmaq_n_f32(va2, vcvtq_f32_s32(arm_dot32_v(wb, xq2 + off)), w_scale * xs2[b_idx]);
+                    va3 = vfmaq_n_f32(va3, vcvtq_f32_s32(arm_dot32_v(wb, xq3 + off)), w_scale * xs3[b_idx]);
 #elif defined(EIF_ARCH_X86_64)
                     __m128i w_raw0 = _mm_loadu_si128((const __m128i *)wb);
                     __m128i w_raw1 = _mm_loadu_si128((const __m128i *)(wb + 16));
@@ -1101,6 +1099,9 @@ static void bert_gemm_int8_gguf(
                     acc3 += (float)s3 * (w_scale * xs3[b_idx]);
 #endif
                 }
+#if defined(EIF_ARCH_ARM64)
+                acc0 = vaddvq_f32(va0); acc1 = vaddvq_f32(va1); acc2 = vaddvq_f32(va2); acc3 = vaddvq_f32(va3);
+#endif
                 Y[(t + 0) * rows + r] = acc0 + b;
                 Y[(t + 1) * rows + r] = acc1 + b;
                 Y[(t + 2) * rows + r] = acc2 + b;

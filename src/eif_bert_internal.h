@@ -64,6 +64,13 @@ static inline int32_t arm_dot32(const int8_t *wb, const int8_t *xb)
     vacc = vdotq_s32(vacc, vld1q_s8(wb + 16), vld1q_s8(xb + 16));
     return vaddvq_s32(vacc);
 }
+/* Same dot product, left as 4 partial sums so callers reduce once per row instead of once per block. */
+static inline int32x4_t arm_dot32_v(const int8_t *wb, const int8_t *xb)
+{
+    int32x4_t vacc = vdupq_n_s32(0);
+    vacc = vdotq_s32(vacc, vld1q_s8(wb), vld1q_s8(xb));
+    return vdotq_s32(vacc, vld1q_s8(wb + 16), vld1q_s8(xb + 16));
+}
 #if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC pop_options
 #endif
