@@ -47,6 +47,7 @@ typedef struct {
     const float *token_emb_scales;
     const float *pos_emb;
     bool         pos_emb_allocated;
+    int          pos_rows;  /**< actual row count of position_embd (0 = full context) */
     const float *type_emb;
     const float *emb_norm_w;
     const float *emb_norm_b;

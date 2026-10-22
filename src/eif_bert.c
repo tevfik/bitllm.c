@@ -1716,8 +1716,16 @@ static int eif_bert_load_gguf(eif_bert_t *bert, const uint8_t *addr, size_t file
 
     uint32_t pos_type = 0;
     const void *raw_pos = find_gguf_tensor(tdescs, (int)n_tensors, data_start, "position_embd.weight", &pos_type);
-    if (pos_type == 8 && raw_pos) {
-        float *dequant_pos = (float *)malloc((size_t)max_seq * dim * sizeof(float));
+    /* Actual row count of the position table: never trust max_seq blindly —
+     * several published GGUF encoders store fewer positional rows than
+     * bert.context_length, and reading past the table produces NaN. */
+    bert->weights.pos_rows = max_seq;
+    for (int ti = 0; ti < (int)n_tensors; ti++) {
+        if (strcmp(tdescs[ti].name, "position_embd.weight") == 0) {
+            if (tdescs[ti].ne[0] > 0) bert->weights.pos_rows = (int)tdescs[ti].ne[0];
+        }
+    }
+    if (pos_type == 8 && raw_pos) {        float *dequant_pos = (float *)malloc((size_t)max_seq * dim * sizeof(float));
         int blocks_dim = dim / 32;
         const uint8_t *w_bytes = (const uint8_t *)raw_pos;
         for (int t = 0; t < max_seq; t++) {
@@ -1733,6 +1741,20 @@ static int eif_bert_load_gguf(eif_bert_t *bert, const uint8_t *addr, size_t file
         }
         bert->weights.pos_emb = dequant_pos;
         bert->weights.pos_emb_allocated = true;
+    } else if (pos_type == 1 && raw_pos) {
+        /* FP16 table stored directly — expand to FP32 instead of
+         * reinterpret-casting the raw bytes as floats. */
+        float *dequant_pos = (float *)malloc((size_t)bert->weights.pos_rows * dim * sizeof(float));
+        if (dequant_pos) {
+            const uint16_t *w16 = (const uint16_t *)raw_pos;
+            for (int t = 0; t < bert->weights.pos_rows * dim; t++)
+                dequant_pos[t] = fp16_to_fp32(w16[t]);
+            bert->weights.pos_emb = dequant_pos;
+            bert->weights.pos_emb_allocated = true;
+        } else {
+            bert->weights.pos_emb = (const float *)raw_pos;
+            bert->weights.pos_emb_allocated = false;
+        }
     } else {
         bert->weights.pos_emb = (const float *)raw_pos;
         bert->weights.pos_emb_allocated = false;
@@ -2173,6 +2195,11 @@ int eif_bert_embed(eif_bert_t *bert, const char *text, float *out_embedding)
     int32_t tokens[512];
     int T = eif_bert_tokenize(bert, text, tokens, (max_tokens > 512) ? 512 : max_tokens);
     if (T <= 0) return -2;
+
+    /* Position table may be shorter than the advertised context (see loader);
+     * clamping prevents out-of-bounds positional reads -> NaN vectors. */
+    if (bert->weights.pos_emb && bert->weights.pos_rows > 0 && T > bert->weights.pos_rows)
+        T = bert->weights.pos_rows;
 
     int dim = bert->config.dim;
     int inter_dim = bert->config.intermediate_dim;
