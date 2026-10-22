@@ -1595,6 +1595,9 @@ static int eif_bert_load_gguf(eif_bert_t *bert, const uint8_t *addr, size_t file
     bert->config.head_dim = dim / n_heads;
     bert->config.att_type = 0;
     bert->config.norm_style = 0;
+    bert->config.use_rope = false;
+    bert->config.ffn_silu = false;
+    if (strcmp(arch_name, "nomic-bert") == 0) { bert->config.use_rope = true; bert->config.ffn_silu = true; }
     bert->config.emb_scale = 0.0f;
     bert->config.attn_scale = 0.0f;
     bert->config.n_embd_per_layer = 0;
@@ -1697,7 +1700,7 @@ static int eif_bert_load_gguf(eif_bert_t *bert, const uint8_t *addr, size_t file
     if (raw_pos == NULL) {
         /* RoPE models (gemma-embedding) have no absolute position table on
          * purpose — they use rotary embeddings, not ALiBi. */
-        if (bert->config.norm_style == 0) bert->config.use_alibi = true;
+        if (bert->config.norm_style == 0 && !bert->config.use_rope) bert->config.use_alibi = true;
     }
     bert->weights.type_emb   = (const float *)find_gguf_tensor(tdescs, (int)n_tensors, data_start, "token_types.weight", NULL);
     bert->weights.type_rows  = 1;
@@ -1835,13 +1838,29 @@ static int eif_bert_load_gguf(eif_bert_t *bert, const uint8_t *addr, size_t file
         }
     }
 
-    /* A missing projection used to load "successfully" and crash in the first GEMM (nomic-bert ships a
-     * fused attn_qkv tensor, for example). Refuse such files up front. */
+    /* Fused attn_qkv (nomic-bert): rows [0,dim) are Q, [dim,2dim) K, [2dim,3dim) V, so the three projections
+     * are plain row offsets into the same tensor (Q8_0 / F32 only, the layouts bert_gemm reads). */
+    for (int l = 0; l < n_layers; l++) {
+        if (bert->weights.q_w[l]) continue;
+        uint32_t ft = 0;
+        snprintf(tname, sizeof(tname), "blk.%d.attn_qkv.weight", l);
+        const uint8_t *f = (const uint8_t *)find_gguf_tensor(tdescs, (int)n_tensors, data_start, tname, &ft);
+        size_t row = (bert->config.qtype == 2 && ft == 8) ? (size_t)(dim / 32) * 34 : (bert->config.qtype == 0 && ft == 0) ? (size_t)dim * 4 : 0;
+        if (!f || !row) continue;
+        bert->weights.q_w[l] = f;
+        bert->weights.k_w[l] = f + row * (size_t)dim;
+        bert->weights.v_w[l] = f + 2 * row * (size_t)dim;
+        snprintf(tname, sizeof(tname), "blk.%d.attn_qkv.bias", l);
+        const float *fb = (const float *)find_gguf_tensor(tdescs, (int)n_tensors, data_start, tname, NULL);
+        if (fb) { bert->weights.q_b[l] = fb; bert->weights.k_b[l] = fb + dim; bert->weights.v_b[l] = fb + 2 * dim; }
+    }
+
+    /* A missing projection used to load "successfully" and crash in the first GEMM. Refuse such files up front. */
     for (int l = 0; l < n_layers; l++) {
         if (!bert->weights.q_w[l] || !bert->weights.k_w[l] || !bert->weights.v_w[l] || !bert->weights.out_w[l] ||
             !bert->weights.ffn_up_w[l] || !bert->weights.ffn_down_w[l]) {
             fprintf(stderr, "eif_bert: architecture '%s' is not supported: layer %d lacks separate attn_q/k/v/output or ffn_up/down tensors "
-                            "(fused attn_qkv layouts are not implemented)\n", arch_name, l);
+                            "(unsupported fused layout)\n", arch_name, l);
             free(tdescs);
             return -9;
         }
@@ -2987,7 +3006,7 @@ static int bert_forward(eif_bert_t *bert, const int32_t *tokens, const uint8_t *
     }
 
     /* 2. Transformer Layers */
-    bool use_alibi = bert->config.use_alibi || (bert->weights.pos_emb == NULL);
+    bool use_alibi = !bert->config.use_rope && (bert->config.use_alibi || (bert->weights.pos_emb == NULL));
 
     for (int l = 0; l < n_layers; l++) {
         /* 2a. Batched Q, K, V Projections for all T tokens */
@@ -3004,6 +3023,14 @@ static int bert_forward(eif_bert_t *bert, const int32_t *tokens, const uint8_t *
                 bert_layernorm(Q + t * dim, Q + t * dim, bert->weights.q_norm_w[l], bert->weights.q_norm_b[l], dim, 1e-12f);
                 bert_layernorm(K + t * dim, K + t * dim, bert->weights.k_norm_w[l], bert->weights.k_norm_b[l], dim, 1e-12f);
             }
+        }
+
+        if (bert->config.use_rope) {
+            for (int t = 0; t < T; t++)
+                for (int h = 0; h < n_heads; h++) {
+                    gemma_rope(Q + (size_t)t * dim + (size_t)h * head_dim, t, head_dim, bert->config.rope_freq_base);
+                    gemma_rope(K + (size_t)t * dim + (size_t)h * head_dim, t, head_dim, bert->config.rope_freq_base);
+                }
         }
 
         /* 2b. Multi-Head Bidirectional Self-Attention */
@@ -3152,7 +3179,11 @@ static int bert_forward(eif_bert_t *bert, const int32_t *tokens, const uint8_t *
             float *H_GATE = H_INTER + (size_t)T * inter_dim;
             bert_gemm(H_GATE, bert->weights.ffn_gate_w[l], NULL,
                       X, NULL, T, inter_dim, dim, qtype);
-            bert_gelu(H_GATE, H_GATE, T * inter_dim);
+            if (bert->config.ffn_silu) {
+                for (int i = 0; i < T * inter_dim; i++) H_GATE[i] = H_GATE[i] / (1.0f + expf(-H_GATE[i]));
+            } else {
+                bert_gelu(H_GATE, H_GATE, T * inter_dim);
+            }
             for (int i = 0; i < T * inter_dim; i++) H_INTER[i] *= H_GATE[i];
         } else {
             bert_gelu(H_INTER, H_INTER, T * inter_dim);

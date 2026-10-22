@@ -38,6 +38,8 @@ typedef struct {
     int max_seq_len;      /**< Maximum sequence context length (e.g. 512) */
     int vocab_size;       /**< Vocabulary size (e.g. 30522) */
     int qtype;            /**< 0=FP32, 1=INT8 EIFM separated, 2=INT8 GGUF interleaved */
+    bool use_rope;        /**< rotary Q/K (NeoX half-split) instead of absolute positions/ALiBi (nomic-bert) */
+    bool ffn_silu;        /**< gated FFN activation is SiLU (SwiGLU) instead of GELU (GEGLU) */
     bool use_alibi;       /**< Attention with Linear Biases (e.g. Jina Embeddings v2) */
     int pooling_type;     /**< 0/1=Mean pooling, 2=CLS pooling */
 

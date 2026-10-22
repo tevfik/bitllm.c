@@ -27,12 +27,12 @@ Designed from the ground up for seamless embedding into applications (such as [g
 | Interface | Models (GGUF unless noted) | Reference / status |
 |---|---|---|
 | Text generation | Qwen2/2.5 (INT8 dense), Qwen3.5 0.8B/2B text (INT4 repack, 24 layers, tied head), LLaMA family (SmolLM2, Granite, MiniCPM; interleaved RoPE), BitNet, `.eifm` | greedy "Paris" check, repeatability, long prompt (`test_gen_matrix`) |
-| Embeddings | BERT/MiniLM/BGE/E5/Arctic (WordPiece), bge-m3 (Unigram), jina-v2-code (BPE), EmbeddingGemma 300m / 2 (SPM merge / Gemma4 BPE) | cosine vs llama.cpp on short, code and ~1400-token inputs (`test_embed_matrix`) |
+| Embeddings | BERT/MiniLM/BGE/E5/Arctic (WordPiece), nomic-embed-text-v1.5 (nomic-bert: fused QKV, RoPE, SwiGLU; add the `search_document: ` task prefix yourself), bge-m3 (Unigram), jina-v2-code (BPE), EmbeddingGemma 300m / 2 (SPM merge / Gemma4 BPE) | cosine vs llama.cpp on short, code and ~1400-token inputs (`test_embed_matrix`) |
 | Reranking | bge-reranker-v2-m3 (`--rerank Q --doc D ...`, `eif_llm_rerank`) | logit within 0.1 of HF fp32, same token ids (`test_rerank_matrix`) |
 | Vision + text | Granite-Docling (SigLIP2), Qwen3.5 `.eifm` | `test_docling_native`, `test_siglip_*` |
 | Audio | not supported | – |
 
-Refused at load with a clear error (no crash, no silent LLaMA fallback): nomic-bert (fused `attn_qkv`), modern-bert,
+Refused at load with a clear error (no crash, no silent LLaMA fallback): modern-bert (granite-embedding-multilingual),
 unknown `general.architecture` values. Known gaps are listed in
 `KNOWN_GAPS` in `tests/test_embed_matrix.c` (currently none).
 

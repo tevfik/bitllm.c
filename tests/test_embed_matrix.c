@@ -27,7 +27,6 @@
 
 /* Files that must be refused cleanly at load (no crash, no garbage): fused attn_qkv layouts etc. */
 static const char *const KNOWN_UNSUPPORTED[] = {
-    "nomic-embed-text-v1.5-Q8_0",                    /* nomic-bert: fused attn_qkv, RoPE, SwiGLU */
     "granite-embedding-97m-multilingual-r2-q8_0",    /* modern-bert: not implemented */
     NULL};
 
