@@ -58,6 +58,11 @@ bitllm.c/
 │   ├── eif_quantize_bitnet.h # Walsh-Hadamard transform & BitNet quantization
 │   └── eif_gpu.h             # Optional Vulkan compute abstraction
 ├── src/                      # C99 kernel implementations
+│   ├── eif_bert.c            # encoder: GGUF/EIFM loader, forward pass, pooling, reranker head
+│   ├── eif_bert_kernels.c    # LayerNorm, GELU, RoPE, batched GEMM (F32 / INT8 / Q8_0; AVX2, NEON)
+│   ├── eif_bert_gemma.c      # Gemma-embedding encoders (300m, 2)
+│   ├── eif_bert_tokenizer.c  # WordPiece, SPM merge, Unigram, Gemma4 BPE, pair encoding
+│   └── eif_bert_internal.h   # shared by the four files above (not public)
 ├── cli/
 │   └── main.c                # Interactive / one-shot CLI runner (bitllm-run)
 └── tests/                    # Feature verification & benchmark suites
