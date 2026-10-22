@@ -39,6 +39,15 @@ typedef struct {
     int qtype;            /**< 0=FP32, 1=INT8 EIFM separated, 2=INT8 GGUF interleaved */
     bool use_alibi;       /**< Attention with Linear Biases (e.g. Jina Embeddings v2) */
     int pooling_type;     /**< 0/1=Mean pooling, 2=CLS pooling */
+
+    /* Extended attention/normalization controls (0/legacy when absent) */
+    int   att_type;        /**< 0=absolute pos, 1=ALiBi, 2=RoPE per-head (gemma-embedding) */
+    int   n_kv_heads;      /**< KV heads; 0 = same as n_heads (MHA) */
+    int   head_dim;        /**< Per-head dim; 0 = dim / n_heads */
+    float rope_freq_base;  /**< RoPE theta (att_type==2, e.g. 1e6) */
+    int   norm_style;      /**< 0=LayerNorm, 1=Gemma RMS * (1+w) */
+    float norm_eps;        /**< LN eps (1e-12 default) / RMS eps (1e-6) */
+    float emb_scale;       /**< 0=none; else embeddings *= this before first norm (gemma: sqrt(dim)) */
 } eif_bert_config_t;
 
 typedef struct {
@@ -92,6 +101,16 @@ typedef struct {
     const float **q_norm_b;
     const float **k_norm_w;
     const float **k_norm_b;
+
+    /* Gemma-embedding style (norm_style==1): four per-layer RMS norms +
+     * final output norm. Q/K norms above are reused (RMS, biasless).
+     * NOTE: like llama.cpp converters, stored norm weights are already the
+     * trained (1+w) values -> runtime is plain rms_norm(x) * w. */
+    const float **pre_attn_norm_w;    /**< blk.N.attn_norm.weight (pre-attention) */
+    const float **attn_post_norm_w;   /**< blk.N.post_attention_norm.weight (attention OUTPUT, before residual) */
+    const float **pre_ffn_norm_w;     /**< blk.N.ffn_norm.weight (pre-FFN) */
+    const float **post_ffw_norm_w;    /**< blk.N.post_ffw_norm.weight (FFN output, before residual) */
+    const float  *output_norm_w;      /**< output_norm.weight (final) */
 } eif_bert_weights_t;
 
 #include "eif_bpe_tokenizer.h"
