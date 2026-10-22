@@ -211,8 +211,9 @@ int main(int argc, char **argv)
 
         eif_bert_t bert;
         memset(&bert, 0, sizeof(bert));
-        if (eif_bert_load(&bert, model_path) != 0) {
-            fprintf(stderr, "\n[Error] Failed to load embedding model '%s'\n", model_path);
+        int load_rc = eif_bert_load(&bert, model_path);
+        if (load_rc != 0) {
+            fprintf(stderr, "\n[Error] Failed to load embedding model '%s' (eif_bert_load rc=%d)\n", model_path, load_rc);
             return 1;
         }
 

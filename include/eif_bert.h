@@ -30,7 +30,8 @@ extern "C" {
 #endif
 
 typedef struct {
-    int dim;              /**< Hidden dimension (e.g. 384) */
+    int dim;              /**< OUTPUT embedding dimension (post-projection; e.g. 384) */
+    int dim_model;        /**< Backbone hidden dimension (0 = dim; EmbeddingGemma2: 512 backbone -> 768 out) */
     int intermediate_dim; /**< FFN intermediate dimension (e.g. 1536) */
     int n_layers;         /**< Number of transformer encoder layers (e.g. 6) */
     int n_heads;          /**< Number of attention heads (e.g. 12) */
@@ -45,9 +46,13 @@ typedef struct {
     int   n_kv_heads;      /**< KV heads; 0 = same as n_heads (MHA) */
     int   head_dim;        /**< Per-head dim; 0 = dim / n_heads */
     float rope_freq_base;  /**< RoPE theta (att_type==2, e.g. 1e6) */
+    float rope_freq_base_swa; /**< RoPE theta for SWA layers (gemma-embedding2: 1e4) */
     int   norm_style;      /**< 0=LayerNorm, 1=Gemma RMS * (1+w) */
     float norm_eps;        /**< LN eps (1e-12 default) / RMS eps (1e-6) */
     float emb_scale;       /**< 0=none; else embeddings *= this before first norm (gemma: sqrt(dim)) */
+    float attn_scale;      /**< 0=legacy 1/sqrt(head_dim); else fixed attention scale
+                             *   (gemma-embedding2 uses 1.0: QK-norm makes scaling redundant) */
+    int   n_embd_per_layer;/**< Per-layer embedding width (gemma-embedding2: 512; 0 = unsupported) */
 } eif_bert_config_t;
 
 typedef struct {
@@ -111,6 +116,19 @@ typedef struct {
     const float **pre_ffn_norm_w;     /**< blk.N.ffn_norm.weight (pre-FFN) */
     const float **post_ffw_norm_w;    /**< blk.N.post_ffw_norm.weight (FFN output, before residual) */
     const float  *output_norm_w;      /**< output_norm.weight (final) */
+
+    /* gemma-embedding2 (EmbeddingGemma-2): per-layer embeddings (PLE) +
+     * per-layer head config + final output projection. */
+    const void  **g2_inp_gate;        /**< blk.N.inp_gate.weight [dim,dim] */
+    const void  **g2_proj;            /**< blk.N.proj.weight [dim,dim] */
+    const float **g2_post_norm;       /**< blk.N.post_norm.weight [dim] */
+    const float **g2_out_scale;       /**< blk.N.layer_output_scale.weight [1] */
+    const float  *g2_pl_model_proj;   /**< per_layer_model_proj [dim, dim*n_layers] (dequantized BF16) */
+    const float  *g2_pl_proj_norm;    /**< per_layer_proj_norm [dim] */
+    const void  *g2_out;              /**< output.weight [dim_model, dim_out] final projection */
+    int          *g2_head_dim;        /**< per-layer head dim (256 SWA / 512 global) */
+    int          *g2_n_kv;            /**< per-layer KV head count (2 SWA / 1 global) */
+    int           g2_max_q_dim;       /**< max over layers of n_heads*head_dim (scratch sizing) */
 } eif_bert_weights_t;
 
 #include "eif_bpe_tokenizer.h"
@@ -154,7 +172,10 @@ typedef struct {
     float *scratch_v;        /**< [max_seq_len * dim] */
     float *scratch_att;      /**< [n_heads * max_seq_len * max_seq_len] */
     float *scratch_inter;    /**< [max_seq_len * intermediate_dim] */
-    float *scratch_proj;     /**< [max_seq_len * dim] */
+    float *scratch_proj;     /**< [max_seq_len * max(dim, dim_out)] */
+    float *scratch_pl;       /**< gemma-embedding2: per-layer input table [max_t * dim_model * n_layers] (precomputed, RMS-normed) */
+    float *scratch_g2;       /**< gemma-embedding2: PLE gate scratch [max_t * dim_model] */
+    float *scratch_attout;   /**< gemma-embedding2: attention output accum [max_t * max_q_dim] (heads can exceed dim_model) */
 
     bool is_initialized;
 } eif_bert_t;
@@ -187,7 +208,8 @@ int eif_bert_tokenize(const eif_bert_t *bert, const char *text, int32_t *out_tok
  *
  * @param bert          Loaded BERT engine
  * @param text          Input text to embed
- * @param out_embedding Output float buffer of size bert->config.dim
+ * @param out_embedding Output float buffer of size bert->config.dim (the
+ *                      OUTPUT embedding dim; gemma-embedding2: 768)
  * @return 0 on success, negative error code on failure
  */
 int eif_bert_embed(eif_bert_t *bert, const char *text, float *out_embedding);
