@@ -70,6 +70,7 @@ typedef struct {
     int seq_len;           // Maximum sequence length
     tinyllm_qtype_t qtype; // Weight quantization type
     int head_dim;          // Head dimension (if 0, defaults to dim / n_heads)
+    int   rope_interleaved; // 1 = RoPE rotates adjacent pairs (llama.cpp llama-family GGUF), 0 = half-split (HF)
     float rope_theta;      // RoPE base frequency (if 0.0f, defaults to 10000.0f or 100000.0f)
     int kv_type;           // KV cache type: 0 = FP32 (default), 1 = INT8 quantized
     int bitnet_group;      // BitNet: max ternary scale group (0 = one scale per row); per matrix the largest

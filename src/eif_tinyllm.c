@@ -482,23 +482,27 @@ float *tinyllm_forward_embedding_ex(tinyllm_t *llm, const float *embedding, int 
         for (int h = 0; h < p->n_heads; h++) {
             float *qh = s->q + h * head_dim;
             for (int j = 0; j < half_head; j++) {
-                float q0 = qh[j];
-                float q1 = qh[j + half_head];
+                int ia = p->rope_interleaved ? 2 * j : j;
+                int ib = p->rope_interleaved ? 2 * j + 1 : j + half_head;
+                float q0 = qh[ia];
+                float q1 = qh[ib];
                 float c = rope_cos[j];
                 float s_val = rope_sin[j];
-                qh[j]             = q0 * c - q1 * s_val;
-                qh[j + half_head] = q1 * c + q0 * s_val;
+                qh[ia] = q0 * c - q1 * s_val;
+                qh[ib] = q1 * c + q0 * s_val;
             }
         }
         for (int h = 0; h < p->n_kv_heads; h++) {
             float *kh = k + h * head_dim;
             for (int j = 0; j < half_head; j++) {
-                float k0 = kh[j];
-                float k1 = kh[j + half_head];
+                int ia = p->rope_interleaved ? 2 * j : j;
+                int ib = p->rope_interleaved ? 2 * j + 1 : j + half_head;
+                float k0 = kh[ia];
+                float k1 = kh[ib];
                 float c = rope_cos[j];
                 float s_val = rope_sin[j];
-                kh[j]             = k0 * c - k1 * s_val;
-                kh[j + half_head] = k1 * c + k0 * s_val;
+                kh[ia] = k0 * c - k1 * s_val;
+                kh[ib] = k1 * c + k0 * s_val;
             }
         }
 
@@ -1088,23 +1092,27 @@ float *tinyllm_forward_batch_embeddings(tinyllm_t *llm, const float *embeddings,
             for (int h = 0; h < p->n_heads; h++) {
                 float *qh = q_tok + h * head_dim;
                 for (int j = 0; j < half_head; j++) {
-                    float q0 = qh[j];
-                    float q1 = qh[j + half_head];
+                    int ia = p->rope_interleaved ? 2 * j : j;
+                    int ib = p->rope_interleaved ? 2 * j + 1 : j + half_head;
+                    float q0 = qh[ia];
+                    float q1 = qh[ib];
                     float c = rcos[j];
                     float s_val = rsin[j];
-                    qh[j]             = q0 * c - q1 * s_val;
-                    qh[j + half_head] = q1 * c + q0 * s_val;
+                    qh[ia] = q0 * c - q1 * s_val;
+                    qh[ib] = q1 * c + q0 * s_val;
                 }
             }
             for (int h = 0; h < p->n_kv_heads; h++) {
                 float *kh = k_tok + h * head_dim;
                 for (int j = 0; j < half_head; j++) {
-                    float k0 = kh[j];
-                    float k1 = kh[j + half_head];
+                    int ia = p->rope_interleaved ? 2 * j : j;
+                    int ib = p->rope_interleaved ? 2 * j + 1 : j + half_head;
+                    float k0 = kh[ia];
+                    float k1 = kh[ib];
                     float c = rcos[j];
                     float s_val = rsin[j];
-                    kh[j]             = k0 * c - k1 * s_val;
-                    kh[j + half_head] = k1 * c + k0 * s_val;
+                    kh[ia] = k0 * c - k1 * s_val;
+                    kh[ib] = k1 * c + k0 * s_val;
                 }
             }
 
@@ -3603,6 +3611,10 @@ int tinyllm_load_gguf(tinyllm_t *llm, const char *filename, void *quant_buffer, 
         }
     }
 
+    /* llama.cpp converts llama-family checkpoints with permuted Q/K rows for adjacent-pair
+     * (interleaved) RoPE; qwen2 & co keep the HuggingFace half-split layout. */
+    llm->config.rope_interleaved = (strcmp(model_arch, "llama") == 0 || strcmp(model_arch, "granite") == 0 ||
+                                    strcmp(model_arch, "minicpm") == 0 || strcmp(model_arch, "smollm") == 0) ? 1 : 0;
     if (llm->config.rope_theta <= 0.0f) {
         if (strstr(model_arch, "qwen") != NULL || strstr(filename, "qwen") != NULL) {
             llm->config.rope_theta = 1000000.0f;

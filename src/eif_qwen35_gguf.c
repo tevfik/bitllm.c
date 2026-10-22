@@ -333,7 +333,6 @@ int qwen35_gguf_build_image(const uint8_t *file, size_t file_size, void **out_im
     const gguf_tensor_desc_t *te = err ? NULL : find_t(&tm, "token_embd.weight");
     if (err || !te) { free(td); return -4; }
     int vocab = (int)te->ne[1];
-    if (nh * hd != dim || nv * vd != dim) { fprintf(stderr, "qwen35 gguf: runtime needs q_dim == val_dim == dim\n"); free(td); return -4; }
 
     uint8_t layer_full[24];
     int n_fa = 0, n_dn = 0;
