@@ -134,6 +134,31 @@ one command-buffer submit. The language model still runs on the CPU. GPU and CPU
 - Shaders: sources in `shaders/*.comp`; `scripts/gen_spv.sh [glslangValidator]` regenerates the committed
   `src/eif_vk_shaders.h`, so normal builds need no shader compiler.
 
+### 5. GPU embedding / reranker encoders (Vulkan, opt-in)
+
+```bash
+BITLLM_BERT_GPU=1 ./your_app model.gguf      # any program that uses eif_bert_* / eif_llm_embed / eif_llm_rerank
+```
+
+With `BITLLM_BERT_GPU=1` and a Vulkan device, the transformer layers of plain post-LN BERT/XLM-R GGUFs (all-MiniLM, bge-small,
+e5, arctic, granite-30m, bge-m3, bge-reranker-v2-m3) run in one command buffer: QKV, attention (fused for head dim 64),
+output projection, LayerNorm and the GELU FFN. Q8_0 weights are repacked once and stay resident (dequantised inside the GEMM
+kernel, FP32 activations). Embedding lookup and pooling stay on the CPU. Other encoders (nomic, modern-bert/granite
+multilingual, jina/alibi, gemma) offload only their Q8_0 GEMMs; the rest of their layer runs on the CPU as before.
+
+| model (GB10) | tokens | CPU | GPU |
+|---|---|---|---|
+| all-MiniLM-L6-v2 | 400 | 36 ms | 6 ms |
+| bge-m3 | 100 | 132 ms | 34 ms |
+| bge-m3 | 400 | 615 ms | 73 ms |
+
+- Short inputs stay on the CPU (below 24 tokens for 768+ wide models, 64 otherwise; `BITLLM_BERT_GPU_MIN_T=n` overrides).
+  Any GPU failure falls back to the CPU for that call.
+- Accuracy: the reference matrix against llama.cpp passes unchanged with every layer on the GPU (cosine >= 0.9989; the CPU
+  path quantises activations to INT8, the GPU keeps them FP32). `test_embed_matrix_gpu` and `test_bert_gpu` check this.
+- Not thread-safe (one forward pass at a time); the variable is read at model load, so models loaded without it stay on the CPU.
+- A CMake cache from before this feature may have `BITLLM_ENABLE_VULKAN=OFF`: configure with `-DBITLLM_ENABLE_VULKAN=ON`.
+
 ---
 
 ## 🧩 Embedding into Gleann / C Applications

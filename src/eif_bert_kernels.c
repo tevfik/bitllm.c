@@ -1167,6 +1167,7 @@ void bert_gemm(
     int qtype)
 {
     if (qtype == 2) {
+        if (bert_gpu_gemm(Y, W, X, bias, T, rows, cols)) return;
         bert_gemm_int8_gguf(Y, (const uint8_t *)W, X, bias, T, rows, cols);
     } else if (qtype == 1) {
         bert_gemm_int8(Y, (const int8_t *)W, W_scales, X, bias, T, rows, cols);

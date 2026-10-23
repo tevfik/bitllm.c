@@ -55,6 +55,7 @@ set(BITLLM_SOURCES
     src/eif_bert_kernels.c
     src/eif_bert_gemma.c
     src/eif_bert_modern.c
+    src/eif_bert_gpu.c
     src/eif_bert_tokenizer.c
     src/eif_gpu.c
     src/eif_gemm.c
@@ -366,3 +367,21 @@ if(OpenMP_C_FOUND)
 endif()
 add_test(NAME test_rerank_matrix COMMAND test_rerank_matrix)
 set_tests_properties(test_rerank_matrix PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+
+# 14. Vulkan encoder path vs the CPU kernels (test_bert_gpu; needs BITLLM_MODELS and a Vulkan device, otherwise SKIP)
+add_executable(test_bert_gpu tests/test_bert_gpu.c)
+target_link_libraries(test_bert_gpu PRIVATE bitllm_static)
+if(NOT WIN32)
+    target_link_libraries(test_bert_gpu PRIVATE m)
+endif()
+if(OpenMP_C_FOUND)
+    target_link_libraries(test_bert_gpu PRIVATE OpenMP::OpenMP_C)
+endif()
+add_test(NAME test_bert_gpu COMMAND test_bert_gpu)
+set_tests_properties(test_bert_gpu PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+if(BITLLM_ENABLE_VULKAN)
+    # the llama.cpp reference matrix again with every GEMM / layer on the GPU (CPU fallback without a device)
+    add_test(NAME test_embed_matrix_gpu COMMAND test_embed_matrix)
+    set_tests_properties(test_embed_matrix_gpu PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900
+        ENVIRONMENT "BITLLM_BERT_GPU=1;BITLLM_BERT_GPU_MIN_T=1")
+endif()

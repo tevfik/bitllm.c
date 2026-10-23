@@ -245,6 +245,10 @@ int eif_bert_embed(eif_bert_t *bert, const char *text, float *out_embedding);
  *  @return number of tokens, negative on error. */
 int eif_bert_tokenize_pair(const eif_bert_t *bert, const char *a, const char *b, int32_t *out_tokens, uint8_t *out_types, int max_tokens);
 
+/** Number of encoder forward passes that ran their transformer layers on the GPU so far (BITLLM_BERT_GPU=1 and a Vulkan
+ *  device; plain post-LN BERT/XLM-R models only, see eif_bert_gpu.c). 0 means everything ran on the CPU. */
+unsigned long eif_bert_gpu_forwards(void);
+
 /** 1 if the model carries a cross-encoder head (cls.weight / cls.output.weight), e.g. bge-reranker-v2-m3. */
 int eif_bert_is_ranker(const eif_bert_t *bert);
 

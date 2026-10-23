@@ -103,6 +103,12 @@ void bert_gelu_exact(float *out, const float *in, int n);
 void bert_gemm(float *Y, const void *W, const float *W_scales, const float *X, const float *bias,
                int T, int rows, int cols, int qtype);
 
+/* eif_bert_gpu.c: optional Vulkan offload (BITLLM_BERT_GPU=1). bert_gpu_gemm returns 1 when it computed Y. */
+void eif_bert_gpu_attach(eif_bert_t *bert);
+void eif_bert_gpu_detach(eif_bert_t *bert);
+int bert_gpu_layers(eif_bert_t *bert, int T); /* 1 when the layers ran on the GPU (hidden states in scratch_seq_x) */
+int bert_gpu_gemm(float *Y, const void *W, const float *X, const float *bias, int T, int rows, int cols);
+
 void bert_rope_neox(float *x, int pos, int hd, float freq_base);
 
 /* eif_bert.c */

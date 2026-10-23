@@ -141,6 +141,7 @@ static int bert_setup_vocab_and_scratch(eif_bert_t *bert)
     }
 
     bert->is_initialized = true;
+    eif_bert_gpu_attach(bert);
     return 0;
 }
 
@@ -1124,6 +1125,7 @@ void eif_bert_free(eif_bert_t *bert)
     if (bert->weights.g2_head_dim) free((void *)bert->weights.g2_head_dim);
     if (bert->weights.g2_n_kv) free((void *)bert->weights.g2_n_kv);
 
+    eif_bert_gpu_detach(bert);
     if (bert->is_mmap && bert->mmap_addr) {
 #if defined(_WIN32)
         UnmapViewOfFile(bert->mmap_addr);
@@ -1215,6 +1217,7 @@ static int bert_forward(eif_bert_t *bert, const int32_t *tokens, const uint8_t *
 
     /* 2. Transformer Layers */
     bool use_alibi = !bert->config.use_rope && (bert->config.use_alibi || (bert->weights.pos_emb == NULL));
+    if (bert_gpu_layers(bert, T)) return 0;
 
     for (int l = 0; l < n_layers; l++) {
         /* 2a. Batched Q, K, V Projections for all T tokens */
