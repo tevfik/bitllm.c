@@ -24,6 +24,8 @@ enum {
     EIF_GPU_K_BCAST,
     EIF_GPU_K_MERGE,
     EIF_GPU_K_ATTENTION,
+    EIF_GPU_K_GEMM_Q8B,     /* INT8 weights with one scale per 32 codes (GGUF Q8_0 repacked) */
+    EIF_GPU_K_GEMM_Q8B_BIG,
     EIF_GPU_K_COUNT
 };
 
@@ -58,6 +60,9 @@ eif_gpu_buf_t *eif_gpu_buf_create(eif_gpu_context_t *ctx, size_t bytes, bool hos
 void eif_gpu_buf_destroy(eif_gpu_context_t *ctx, eif_gpu_buf_t *b);
 void *eif_gpu_buf_map(eif_gpu_buf_t *b);
 bool eif_gpu_buf_upload(eif_gpu_context_t *ctx, eif_gpu_buf_t *b, size_t offset, const void *src, size_t bytes);
+/* Buffer and scale offset (in floats) of a resident weight, for building command streams by hand. */
+eif_gpu_buf_t *eif_gpu_weight_buf(const eif_gpu_weight_t *w);
+uint32_t eif_gpu_weight_scale_off(const eif_gpu_weight_t *w);
 /* Largest size of one storage buffer binding. */
 size_t eif_gpu_max_binding_bytes(const eif_gpu_context_t *ctx);
 
@@ -65,7 +70,7 @@ bool eif_gpu_cmd_begin(eif_gpu_context_t *ctx);
 /* bufs: bindings 0 A, 1 B, 2 scales/params, 3 bias, 4 C (NULL entries are bound to a dummy buffer). */
 bool eif_gpu_cmd_dispatch(eif_gpu_context_t *ctx, int kernel, eif_gpu_buf_t *const bufs[5],
                           const void *push, uint32_t push_bytes, uint32_t gx, uint32_t gy, uint32_t gz);
-/* Picks the tile size and grid; kernel is EIF_GPU_K_GEMM_F32, _Q8 or _KN; gz = batch count. */
+/* Picks the tile size and grid; kernel is EIF_GPU_K_GEMM_F32, _Q8, _Q8B or _KN; gz = batch count. */
 bool eif_gpu_cmd_gemm(eif_gpu_context_t *ctx, int kernel, eif_gpu_buf_t *A, eif_gpu_buf_t *B, eif_gpu_buf_t *S,
                       eif_gpu_buf_t *bias, eif_gpu_buf_t *C, const eif_gpu_gemm_pc_t *pc, uint32_t gz);
 void eif_gpu_cmd_barrier(eif_gpu_context_t *ctx);

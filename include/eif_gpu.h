@@ -79,6 +79,10 @@ eif_gpu_weight_t *eif_gpu_weight_upload_f32(eif_gpu_context_t *ctx, const float 
 eif_gpu_weight_t *eif_gpu_weight_upload_q8(eif_gpu_context_t *ctx, const int8_t *codes, const float *scales,
                                            int N, int K);
 
+/** @brief Upload a GGUF Q8_0 matrix [N rows, K cols] (interleaved 34-byte blocks: fp16 scale + 32 codes, K % 32 == 0);
+ *         repacked once into codes + FP32 block scales and dequantised in the kernel. */
+eif_gpu_weight_t *eif_gpu_weight_upload_q8_0(eif_gpu_context_t *ctx, const uint8_t *gguf, int N, int K);
+
 /** @brief Release a resident weight (must be called before eif_gpu_cleanup). */
 void eif_gpu_weight_free(eif_gpu_context_t *ctx, eif_gpu_weight_t *w);
 

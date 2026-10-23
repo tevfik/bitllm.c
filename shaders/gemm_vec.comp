@@ -34,10 +34,14 @@ layout(push_constant) uniform PC {
 
 vec4 load_b4(uint idx)
 {
-#if defined(B_INT8)
+#if defined(B_INT8) || defined(B_Q8B)
     uint w = b[idx / 4u];
-    return vec4(bitfieldExtract(int(w), 0, 8), bitfieldExtract(int(w), 8, 8),
-                bitfieldExtract(int(w), 16, 8), bitfieldExtract(int(w), 24, 8));
+    vec4 v = vec4(bitfieldExtract(int(w), 0, 8), bitfieldExtract(int(w), 8, 8),
+                  bitfieldExtract(int(w), 16, 8), bitfieldExtract(int(w), 24, 8));
+#if defined(B_Q8B)
+    v *= sc[p.s_off + (idx >> 5)]; /* idx is a multiple of 4, so the quad stays inside one block of 32 */
+#endif
+    return v;
 #else
     return uintBitsToFloat(b4[idx / 4u]);
 #endif

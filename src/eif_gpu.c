@@ -52,7 +52,7 @@ struct eif_gpu_buf {
 struct eif_gpu_weight {
     eif_gpu_buf_t *buf;
     int N, K;
-    bool q8;
+    int kind;       /* 0 FP32, 1 INT8 + per-row scales, 2 INT8 + one scale per 32 codes */
     uint32_t s_off; /* scales offset in floats (INT8) */
 };
 
@@ -331,9 +331,11 @@ bool eif_gpu_cmd_gemm(eif_gpu_context_t *ctx, int kernel, eif_gpu_buf_t *A, eif_
      * fills the GPU, the general 64x64 kernel otherwise */
     const uint32_t align = pc->K | pc->lda | pc->ldb | pc->a_off | pc->b_off | pc->a_s1 | pc->a_s2 | pc->b_s1 |
                            pc->b_s2;
-    bool big = (kernel == EIF_GPU_K_GEMM_F32 || kernel == EIF_GPU_K_GEMM_Q8) && (align & 3u) == 0 &&
-               (uint64_t)((pc->M + 127) / 128) * ((pc->N + 127) / 128) * gz >= 96;
-    if (big) kernel = (kernel == EIF_GPU_K_GEMM_F32) ? EIF_GPU_K_GEMM_F32_BIG : EIF_GPU_K_GEMM_Q8_BIG;
+    bool big = (kernel == EIF_GPU_K_GEMM_F32 || kernel == EIF_GPU_K_GEMM_Q8 || kernel == EIF_GPU_K_GEMM_Q8B) &&
+               (align & 3u) == 0 && (uint64_t)((pc->M + 127) / 128) * ((pc->N + 127) / 128) * gz >= 96;
+    if (big)
+        kernel = kernel == EIF_GPU_K_GEMM_F32 ? EIF_GPU_K_GEMM_F32_BIG
+               : kernel == EIF_GPU_K_GEMM_Q8  ? EIF_GPU_K_GEMM_Q8_BIG : EIF_GPU_K_GEMM_Q8B_BIG;
     uint32_t tile = big ? 128 : 64;
     eif_gpu_buf_t *bufs[5] = {A, B, S, bias, C};
     return eif_gpu_cmd_dispatch(ctx, kernel, bufs, pc, sizeof(*pc), (pc->N + tile - 1) / tile,
@@ -390,6 +392,8 @@ static bool vk_create_pipelines(vk_state_t *s)
         [EIF_GPU_K_BCAST] = {eif_spv_bcast, sizeof(eif_spv_bcast)},
         [EIF_GPU_K_MERGE] = {eif_spv_merge, sizeof(eif_spv_merge)},
         [EIF_GPU_K_ATTENTION] = {eif_spv_attention, sizeof(eif_spv_attention)},
+        [EIF_GPU_K_GEMM_Q8B] = {eif_spv_gemm_q8b, sizeof(eif_spv_gemm_q8b)},
+        [EIF_GPU_K_GEMM_Q8B_BIG] = {eif_spv_gemm_q8b_big, sizeof(eif_spv_gemm_q8b_big)},
     };
     /* optional kernels: shared memory need, and attention also needs 8-lane-aligned subgroup shuffles */
     static const uint32_t shared_bytes[EIF_GPU_K_COUNT] = { [EIF_GPU_K_ATTENTION] = 44 * 1024 };
@@ -676,7 +680,7 @@ static bool gemm_valid(int M, int N, int K)
 }
 
 /* wbuf is a resident weight buffer or the FP32 W scratch slot. */
-static bool run_gemm(eif_gpu_context_t *ctx, const float *A, eif_gpu_buf_t *wbuf, bool q8, uint32_t s_off,
+static bool run_gemm(eif_gpu_context_t *ctx, const float *A, eif_gpu_buf_t *wbuf, int kind, uint32_t s_off,
                      const float *bias, float *C, int M, int N, int K, int act, bool residual)
 {
     vk_state_t *s = (vk_state_t *)ctx->internal_handle;
@@ -693,11 +697,12 @@ static bool run_gemm(eif_gpu_context_t *ctx, const float *A, eif_gpu_buf_t *wbuf
     pc.lda = (uint32_t)K; pc.ldb = (uint32_t)K; pc.ldc = (uint32_t)N;
     pc.s_off = s_off;
     pc.flags = (bias ? EIF_GPU_GEMM_BIAS : 0) | (act == 1 ? EIF_GPU_GEMM_GELU : 0) |
-               (residual ? EIF_GPU_GEMM_RESIDUAL : 0) | (q8 ? EIF_GPU_GEMM_SCALES : 0);
+               (residual ? EIF_GPU_GEMM_RESIDUAL : 0) | (kind == 1 ? EIF_GPU_GEMM_SCALES : 0);
     pc.zdiv = 1;
     pc.alpha = 1.0f;
     if (!eif_gpu_cmd_begin(ctx)) return false;
-    eif_gpu_cmd_gemm(ctx, q8 ? EIF_GPU_K_GEMM_Q8 : EIF_GPU_K_GEMM_F32, s->scr[0], wbuf, q8 ? wbuf : NULL,
+    eif_gpu_cmd_gemm(ctx, kind == 0 ? EIF_GPU_K_GEMM_F32 : kind == 1 ? EIF_GPU_K_GEMM_Q8 : EIF_GPU_K_GEMM_Q8B,
+                     s->scr[0], wbuf, kind ? wbuf : NULL,
                      bias ? s->scr[3] : NULL, s->scr[4], &pc, 1);
     if (!eif_gpu_cmd_submit(ctx)) return false;
     memcpy(C, s->scr[4]->mapped, sc);
@@ -713,7 +718,7 @@ bool eif_gpu_gemm_f32(eif_gpu_context_t *ctx, const float *A, const float *W, co
     const size_t sw = (size_t)N * K * sizeof(float);
     if (!ensure_scratch(ctx, 1, sw)) return false;
     memcpy(s->scr[1]->mapped, W, sw);
-    return run_gemm(ctx, A, s->scr[1], false, 0, bias, C, M, N, K, activation_mode, residual_add);
+    return run_gemm(ctx, A, s->scr[1], 0, 0, bias, C, M, N, K, activation_mode, residual_add);
 }
 
 eif_gpu_weight_t *eif_gpu_weight_upload_f32(eif_gpu_context_t *ctx, const float *W, int N, int K)
@@ -737,7 +742,7 @@ eif_gpu_weight_t *eif_gpu_weight_upload_q8(eif_gpu_context_t *ctx, const int8_t 
     if (!ctx || !ctx->is_available || !codes || !scales || !gemm_valid(1, N, K)) return NULL;
     eif_gpu_weight_t *w = (eif_gpu_weight_t *)calloc(1, sizeof(*w));
     if (!w) return NULL;
-    w->N = N; w->K = K; w->q8 = true;
+    w->N = N; w->K = K; w->kind = 1;
     const size_t cbytes = ((size_t)N * K + 15) & ~(size_t)15;
     w->s_off = (uint32_t)(cbytes / sizeof(float));
     w->buf = eif_gpu_buf_create(ctx, cbytes + (size_t)N * sizeof(float), false);
@@ -748,6 +753,44 @@ eif_gpu_weight_t *eif_gpu_weight_upload_q8(eif_gpu_context_t *ctx, const int8_t 
     }
     return w;
 }
+
+eif_gpu_weight_t *eif_gpu_weight_upload_q8_0(eif_gpu_context_t *ctx, const uint8_t *gguf, int N, int K)
+{
+    if (!ctx || !ctx->is_available || !gguf || K % 32 != 0 || !gemm_valid(1, N, K)) return NULL;
+    const size_t nb = (size_t)N * (size_t)(K / 32);
+    const size_t cbytes = ((size_t)N * K + 15) & ~(size_t)15;
+    uint8_t *img = (uint8_t *)calloc(1, cbytes + nb * sizeof(float));
+    eif_gpu_weight_t *w = (eif_gpu_weight_t *)calloc(1, sizeof(*w));
+    if (!img || !w) { free(img); free(w); return NULL; }
+    float *scales = (float *)(img + cbytes);
+    for (size_t b = 0; b < nb; b++) {
+        const uint8_t *blk = gguf + b * 34;
+        const uint16_t h = (uint16_t)(blk[0] | (blk[1] << 8));
+        const uint32_t sign = (uint32_t)(h & 0x8000u) << 16, ex = (h >> 10) & 0x1f, man = h & 0x3ff;
+        uint32_t bits;
+        if (ex == 0) { /* zero or subnormal */
+            float f = (float)man * (1.0f / 16777216.0f);
+            memcpy(&bits, &f, 4);
+            bits |= sign;
+        } else if (ex == 31) {
+            bits = sign | 0x7f800000u | (man << 13);
+        } else {
+            bits = sign | ((ex + 112u) << 23) | (man << 13);
+        }
+        memcpy(&scales[b], &bits, 4);
+        memcpy(img + b * 32, blk + 2, 32);
+    }
+    w->N = N; w->K = K; w->kind = 2;
+    w->s_off = (uint32_t)(cbytes / sizeof(float));
+    w->buf = eif_gpu_buf_create(ctx, cbytes + nb * sizeof(float), false);
+    bool ok = w->buf && eif_gpu_buf_upload(ctx, w->buf, 0, img, cbytes + nb * sizeof(float));
+    free(img);
+    if (!ok) { eif_gpu_weight_free(ctx, w); return NULL; }
+    return w;
+}
+
+eif_gpu_buf_t *eif_gpu_weight_buf(const eif_gpu_weight_t *w) { return w ? w->buf : NULL; }
+uint32_t eif_gpu_weight_scale_off(const eif_gpu_weight_t *w) { return w ? w->s_off : 0; }
 
 void eif_gpu_weight_free(eif_gpu_context_t *ctx, eif_gpu_weight_t *w)
 {
@@ -761,7 +804,7 @@ bool eif_gpu_gemm(eif_gpu_context_t *ctx, const float *A, const eif_gpu_weight_t
 {
     if (!ctx || !ctx->is_available || !ctx->internal_handle || !A || !W || !C || !gemm_valid(M, W->N, W->K))
         return false;
-    return run_gemm(ctx, A, W->buf, W->q8, W->s_off, bias, C, M, W->N, W->K, activation_mode, residual_add);
+    return run_gemm(ctx, A, W->buf, W->kind, W->s_off, bias, C, M, W->N, W->K, activation_mode, residual_add);
 }
 
 #else /* !EIF_USE_VULKAN: CPU only */
@@ -796,6 +839,12 @@ eif_gpu_weight_t *eif_gpu_weight_upload_f32(eif_gpu_context_t *ctx, const float 
     return NULL;
 }
 
+eif_gpu_weight_t *eif_gpu_weight_upload_q8_0(eif_gpu_context_t *ctx, const uint8_t *gguf, int N, int K)
+{
+    (void)ctx; (void)gguf; (void)N; (void)K;
+    return NULL;
+}
+
 eif_gpu_weight_t *eif_gpu_weight_upload_q8(eif_gpu_context_t *ctx, const int8_t *codes, const float *scales,
                                            int N, int K)
 {
@@ -826,6 +875,8 @@ bool eif_gpu_buf_upload(eif_gpu_context_t *ctx, eif_gpu_buf_t *b, size_t offset,
 }
 size_t eif_gpu_max_binding_bytes(const eif_gpu_context_t *ctx) { (void)ctx; return 0; }
 bool eif_gpu_kernel_available(const eif_gpu_context_t *ctx, int kernel) { (void)ctx; (void)kernel; return false; }
+eif_gpu_buf_t *eif_gpu_weight_buf(const eif_gpu_weight_t *w) { (void)w; return NULL; }
+uint32_t eif_gpu_weight_scale_off(const eif_gpu_weight_t *w) { (void)w; return 0; }
 bool eif_gpu_cmd_begin(eif_gpu_context_t *ctx) { (void)ctx; return false; }
 bool eif_gpu_cmd_dispatch(eif_gpu_context_t *ctx, int kernel, eif_gpu_buf_t *const bufs[5],
                           const void *push, uint32_t push_bytes, uint32_t gx, uint32_t gy, uint32_t gz)

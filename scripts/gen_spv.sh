@@ -16,6 +16,8 @@ gemm_q8       gemm.comp -DB_INT8
 gemm_kn       gemm.comp -DB_KN
 gemm_f32_big  gemm_vec.comp
 gemm_q8_big   gemm_vec.comp -DB_INT8
+gemm_q8b      gemm.comp -DB_Q8B
+gemm_q8b_big  gemm_vec.comp -DB_Q8B
 layernorm     layernorm.comp
 softmax       softmax.comp
 bcast         bcast.comp

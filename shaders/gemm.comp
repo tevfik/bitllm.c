@@ -3,6 +3,7 @@
  * Tiled GEMM: C[m, n] = epilogue(alpha * sum_k A[m, k] * B(n, k)), batched over gl_WorkGroupID.z.
  *   default : B is FP32 [N, K] (row n contiguous, "NT", i.e. nn.Linear weights or K of attention)
  *   B_INT8  : B is INT8 [N, K] packed 4 per uint, per-row scale S[n] applied in the epilogue
+ *   B_Q8B   : B is INT8 [N, K] with one FP32 scale per 32 codes, S[s_off + idx / 32] (K % 32 == 0, b_off 0)
  *   B_KN    : B is FP32 [K, N] (row k contiguous, V of attention)
  * Epilogue order: *alpha, *scale[n], +bias[n], GELU(tanh), +C (residual).
  * Batch z = zo * zdiv + zi selects base offsets  off + zo * s1 + zi * s2  for A, B and C.
@@ -56,9 +57,13 @@ shared float Bs[BK][BN + 1];
 
 float load_b(uint idx)
 {
-#if defined(B_INT8)
+#if defined(B_INT8) || defined(B_Q8B)
     uint w = b[idx >> 2];
-    return float(bitfieldExtract(int(w), int((idx & 3u) * 8u), 8));
+    float v = float(bitfieldExtract(int(w), int((idx & 3u) * 8u), 8));
+#if defined(B_Q8B)
+    v *= sc[p.s_off + (idx >> 5)]; /* one scale per block of 32 codes (GGUF Q8_0) */
+#endif
+    return v;
 #else
     return uintBitsToFloat(b[idx]);
 #endif

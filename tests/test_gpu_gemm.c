@@ -84,6 +84,56 @@ static void run_case(eif_gpu_context_t *gpu, int M, int N, int K, bool q8, bool 
     free(A); free(W); free(Wq); free(sc); free(bias); free(C); free(C0); free(ref); free(mag);
 }
 
+static double half_to_double(uint16_t h)
+{
+    int e = (h >> 10) & 31, m = h & 1023;
+    double v = e == 0 ? ldexp((double)m, -24) : ldexp((double)(1024 + m), e - 25);
+    return (h & 0x8000) ? -v : v;
+}
+
+/* GGUF Q8_0 weights (interleaved 34-byte blocks: fp16 scale + 32 codes) with one scale per block. */
+static void run_q8_0(eif_gpu_context_t *gpu, int M, int N, int K, bool use_bias)
+{
+    const int nbk = K / 32;
+    uint8_t *G = malloc((size_t)N * nbk * 34);
+    float *A = malloc((size_t)M * K * sizeof(float)), *bias = malloc((size_t)N * sizeof(float));
+    float *C = malloc((size_t)M * N * sizeof(float));
+    double *ref = malloc((size_t)M * N * sizeof(double)), *mag = malloc((size_t)M * N * sizeof(double));
+    double *Wd = malloc((size_t)N * K * sizeof(double));
+    for (size_t i = 0; i < (size_t)M * K; i++) A[i] = frand();
+    for (int i = 0; i < N; i++) bias[i] = frand();
+    for (int n = 0; n < N; n++)
+        for (int b = 0; b < nbk; b++) {
+            uint8_t *blk = G + ((size_t)n * nbk + b) * 34;
+            /* scales spanning several binades (0.0005 .. 0.03) so a wrongly indexed scale shows up */
+            uint16_t h = (uint16_t)(0x1000 + ((s_seed = s_seed * 1103515245u + 12345u) >> 16) % 0x0c00);
+            blk[0] = (uint8_t)(h & 255); blk[1] = (uint8_t)(h >> 8);
+            for (int c = 0; c < 32; c++) {
+                int8_t q = (int8_t)(frand() * 127.0f);
+                blk[2 + c] = (uint8_t)q;
+                Wd[(size_t)n * K + b * 32 + c] = (double)q * half_to_double(h);
+            }
+        }
+    for (int m = 0; m < M; m++)
+        for (int n = 0; n < N; n++) {
+            double acc = 0, mg = 0;
+            for (int k = 0; k < K; k++) {
+                double t = (double)A[(size_t)m * K + k] * Wd[(size_t)n * K + k];
+                acc += t; mg += fabs(t);
+            }
+            ref[(size_t)m * N + n] = acc + (use_bias ? bias[n] : 0.0);
+            mag[(size_t)m * N + n] = mg;
+        }
+    eif_gpu_weight_t *w = eif_gpu_weight_upload_q8_0(gpu, G, N, K);
+    bool ok = w && eif_gpu_gemm(gpu, A, w, use_bias ? bias : NULL, C, M, 0, false);
+    eif_gpu_weight_free(gpu, w);
+    char name[96];
+    snprintf(name, sizeof(name), "q8_0 blocks M=%d N=%d K=%d%s", M, N, K, use_bias ? " +bias" : "");
+    if (!ok) { printf("  FAIL  %s (dispatch failed)\n", name); g_fail++; }
+    else check(name, C, ref, mag, (size_t)M * N, 2e-5);
+    free(G); free(A); free(bias); free(C); free(ref); free(mag); free(Wd);
+}
+
 /* Attention-shaped batched GEMMs: T tiles x H heads, S tokens, head dim D, rows of width 3*H*D (q|k|v). */
 static void run_attention(eif_gpu_context_t *gpu, int T, int H, int S, int D)
 {
@@ -193,6 +243,10 @@ int main(void)
     run_case(&gpu, 129, 255, 770, true, true, 1, false);
     run_case(&gpu, 1024, 2304, 768, true, true, 0, false);  /* 128x128 tiles */
     run_case(&gpu, 1100, 768, 3072, true, true, 0, true);
+    run_q8_0(&gpu, 5, 7, 32, false);                        /* one block per row */
+    run_q8_0(&gpu, 37, 53, 96, true);
+    run_q8_0(&gpu, 1540, 1301, 160, true);                  /* 128x128 tiles, ragged edges */
+    run_q8_0(&gpu, 130, 90, 800, true);                     /* 64x64 tiles, aligned K */
     run_attention(&gpu, 2, 3, 70, 64);
     run_attention(&gpu, 1, 2, 129, 16);
     run_attention(&gpu, 3, 2, 31, 64);
