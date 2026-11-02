@@ -789,6 +789,19 @@ static int eif_bert_load_gguf(eif_bert_t *bert, const uint8_t *addr, size_t file
             } else if (plm_type == 1) { /* F16 */
                 const uint16_t *src = (const uint16_t *)plm;
                 for (size_t i = 0; i < plm_elems; i++) plm_f[i] = fp16_to_fp32(src[i]);
+            } else if (plm_type == 8) { /* Q8_0 (standard quantized GGUF) */
+                const uint8_t *src_bytes = (const uint8_t *)plm;
+                size_t n_blocks = plm_elems / 32;
+                for (size_t b = 0; b < n_blocks; b++) {
+                    const uint8_t *blk = src_bytes + b * 34;
+                    uint16_t scale_h; /* 34-byte blocks: the scale is unaligned, so no pointer cast (UB, SIGBUS risk on strict ARM) */
+                    memcpy(&scale_h, blk, sizeof scale_h);
+                    float scale = fp16_to_fp32(scale_h);
+                    const int8_t *qs = (const int8_t *)(blk + 2);
+                    for (int j = 0; j < 32; j++) {
+                        plm_f[b * 32 + j] = (float)qs[j] * scale;
+                    }
+                }
             } else if (plm_type == 0) {
                 memcpy(plm_f, plm, plm_elems * sizeof(float));
             } else {
