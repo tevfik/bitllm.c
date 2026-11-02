@@ -1,0 +1,27 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-amd64, os: ubuntu-24.04,     experimental: false }
+          - { name: linux-arm64, os: ubuntu-24.04-arm, experimental: false }
+          - { name: macos-arm64, os: macos-14,         experimental: true }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure (CPU only, no GPU on CI runners)
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBITLLM_ENABLE_VULKAN=OFF
+      - name: Build
+        run: cmake --build build --parallel
+      - name: Test (model-dependent tests report SKIP when no GGUF is present)
+        run: ctest --test-dir build --output-on-failure --timeout 300 --parallel 4
