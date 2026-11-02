@@ -9,8 +9,10 @@
  * - Decoder-Only Transformers (Docling, SmolLM, LLaMA)
  */
 
-#define _POSIX_C_SOURCE 199309L
+/* 200809L (not 199309L): on Darwin a low _POSIX_C_SOURCE hides C99 snprintf and strcasestr. */
+#define _POSIX_C_SOURCE 200809L
 #define _DEFAULT_SOURCE
+#define _DARWIN_C_SOURCE
 
 #include "bitllm.h"
 #include "eif_bert.h"
