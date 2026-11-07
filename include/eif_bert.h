@@ -74,8 +74,13 @@ typedef struct {
     int          cls_qtype;
     float       *cls_w_owned; /**< FP32 copy when the file stores FP16 */
     const float *cls_b;
-    const float *cls_out_w;   /**< [dim] output projection */
+    const float *cls_out_w;   /**< [dim] output projection (FP32, converted when stored as FP16) */
+    float       *cls_out_w_owned;
     float        cls_out_b;
+    /** Head layout: 0 none, 1 dense+tanh+output (XLM-R/RoBERTa, bge-reranker), 2 output only on h[CLS]
+     *  (BERT ms-marco GGUFs, where the converter keeps the classifier but no pooler), 3 a single linear
+     *  cls.weight[dim] + cls.bias[1] (jina-reranker-v1). */
+    int          cls_mode;
     const float *emb_norm_w;
     const float *emb_norm_b;
 

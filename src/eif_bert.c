@@ -423,6 +423,17 @@ static int eif_bert_load_gguf(eif_bert_t *bert, const uint8_t *addr, size_t file
     uint32_t tok_type = 0;
     bert->weights.token_emb = find_gguf_tensor(tdescs, (int)n_tensors, data_start, "token_embd.weight", &tok_type);
     bert->config.qtype = (tok_type == 8) ? 2 : 0; /* 2 = Native GGUF Q8_0 interleaved */
+    {   /* The encoder kernels take F32 or Q8_0 weights only. An F16 (or K-quant) file would otherwise be read as
+         * F32 and crash in the GEMM, so refuse it here with a usable message. */
+        uint32_t q0_type = tok_type;
+        int has_q0 = find_gguf_tensor(tdescs, (int)n_tensors, data_start, "blk.0.attn_q.weight", &q0_type) != NULL;
+        if (bert->weights.token_emb && ((tok_type != 0 && tok_type != 8) || (has_q0 && q0_type != tok_type))) {
+            fprintf(stderr, "eif_bert: weight type %u (token_embd) / %u (blk.0.attn_q) is not supported: "
+                    "use an F32 or Q8_0 GGUF of this model\n", tok_type, q0_type);
+            free(tdescs);
+            return -10;
+        }
+    }
 
     uint32_t pos_type = 0;
     const void *raw_pos = find_gguf_tensor(tdescs, (int)n_tensors, data_start, "position_embd.weight", &pos_type);
@@ -483,13 +494,26 @@ static int eif_bert_load_gguf(eif_bert_t *bert, const uint8_t *addr, size_t file
     for (int ti = 0; ti < (int)n_tensors; ti++)
         if (strcmp(tdescs[ti].name, "token_types.weight") == 0 && tdescs[ti].n_dims > 1 && tdescs[ti].ne[1] > 0)
             bert->weights.type_rows = (int)tdescs[ti].ne[1];
-    {   /* cross-encoder / reranker head: cls.weight (dense) -> tanh -> cls.output (1 logit) */
-        uint32_t ct = 0;
+    {   /* cross-encoder / reranker head, see cls_mode in eif_bert.h */
+        uint32_t ct = 0, cot = 0;
         const void *cw = find_gguf_tensor(tdescs, (int)n_tensors, data_start, "cls.weight", &ct);
         const float *cb = (const float *)find_gguf_tensor(tdescs, (int)n_tensors, data_start, "cls.bias", NULL);
-        const float *co = (const float *)find_gguf_tensor(tdescs, (int)n_tensors, data_start, "cls.output.weight", NULL);
+        const void *co = find_gguf_tensor(tdescs, (int)n_tensors, data_start, "cls.output.weight", &cot);
         const float *cob = (const float *)find_gguf_tensor(tdescs, (int)n_tensors, data_start, "cls.output.bias", NULL);
-        if (cw && cb && co) {
+        int cw_rows = 0;   /* second dimension of cls.weight: dim for a dense layer, 1 (or absent) for a projection */
+        for (int ti = 0; ti < (int)n_tensors; ti++)
+            if (strcmp(tdescs[ti].name, "cls.weight") == 0) cw_rows = tdescs[ti].n_dims > 1 ? (int)tdescs[ti].ne[1] : 1;
+        /* [dim] vector as FP32: used in place when FP32, converted when FP16 */
+        #define CLS_VEC_F32(src, type, owned, out) do { \
+            if ((type) == 0) (out) = (const float *)(src); \
+            else if ((type) == 1) { \
+                float *f_ = (float *)malloc((size_t)dim * sizeof(float)); \
+                if (!f_) { free(tdescs); return -8; } \
+                for (int i_ = 0; i_ < dim; i_++) f_[i_] = fp16_to_fp32(((const uint16_t *)(src))[i_]); \
+                (owned) = f_; (out) = f_; \
+            } else { fprintf(stderr, "eif_bert: reranker head tensor type %u unsupported\n", (type)); free(tdescs); return -10; } \
+        } while (0)
+        if (cw && cb && co && cw_rows == dim) {
             if (ct == 8) { bert->weights.cls_w = cw; bert->weights.cls_qtype = 2; }
             else if (ct == 0) { bert->weights.cls_w = cw; bert->weights.cls_qtype = 0; }
             else if (ct == 1) {
@@ -498,8 +522,20 @@ static int eif_bert_load_gguf(eif_bert_t *bert, const uint8_t *addr, size_t file
                 for (size_t i = 0; i < (size_t)dim * dim; i++) f[i] = fp16_to_fp32(((const uint16_t *)cw)[i]);
                 bert->weights.cls_w_owned = f; bert->weights.cls_w = f; bert->weights.cls_qtype = 0;
             } else { fprintf(stderr, "eif_bert: cls.weight type %u unsupported\n", ct); free(tdescs); return -10; }
-            bert->weights.cls_b = cb; bert->weights.cls_out_w = co; bert->weights.cls_out_b = cob ? cob[0] : 0.0f;
+            bert->weights.cls_b = cb;
+            CLS_VEC_F32(co, cot, bert->weights.cls_out_w_owned, bert->weights.cls_out_w);
+            bert->weights.cls_out_b = cob ? cob[0] : 0.0f;
+            bert->weights.cls_mode = 1;
+        } else if (!cw && co) {
+            CLS_VEC_F32(co, cot, bert->weights.cls_out_w_owned, bert->weights.cls_out_w);
+            bert->weights.cls_out_b = cob ? cob[0] : 0.0f;
+            bert->weights.cls_mode = 2;
+        } else if (cw && !co && cw_rows == 1) {
+            CLS_VEC_F32(cw, ct, bert->weights.cls_out_w_owned, bert->weights.cls_out_w);
+            bert->weights.cls_out_b = cb ? cb[0] : 0.0f;
+            bert->weights.cls_mode = 3;
         }
+        #undef CLS_VEC_F32
     }
     bert->weights.emb_norm_w = (const float *)find_gguf_tensor(tdescs, (int)n_tensors, data_start, "token_embd_norm.weight", NULL);
     bert->weights.emb_norm_b = (const float *)find_gguf_tensor(tdescs, (int)n_tensors, data_start, "token_embd_norm.bias", NULL);
@@ -1128,6 +1164,7 @@ void eif_bert_free(eif_bert_t *bert)
     if (bert->scratch_g2) free(bert->scratch_g2);
     if (bert->scratch_attout) free(bert->scratch_attout);
     if (bert->weights.cls_w_owned) free(bert->weights.cls_w_owned);
+    if (bert->weights.cls_out_w_owned) free(bert->weights.cls_out_w_owned);
     if (bert->weights.g2_pl_model_proj) free((void *)bert->weights.g2_pl_model_proj);
     free((void *)bert->weights.pre_attn_norm_w); free((void *)bert->weights.attn_post_norm_w);
     free((void *)bert->weights.pre_ffn_norm_w); free((void *)bert->weights.post_ffw_norm_w);
@@ -1495,12 +1532,13 @@ int eif_bert_embed(eif_bert_t *bert, const char *text, float *out_embedding)
 
 /* ---------------------------------------------------------------------------
  * Cross-encoder ranking (bge-reranker-v2-m3 and friends)
- * score = cls.output . tanh(cls.weight . h[CLS] + cls.bias) + cls.output.bias, on the pair
+ * score = cls.output . tanh(cls.weight . h[CLS] + cls.bias) + cls.output.bias (cls_mode 1; modes 2/3 project h[CLS]
+ * directly), on the pair
  * "<s> query </s></s> doc </s>" (RoBERTa/XLM-R) or "[CLS] query [SEP] doc [SEP]" with segment ids (BERT).
  * ------------------------------------------------------------------------- */
 int eif_bert_is_ranker(const eif_bert_t *bert)
 {
-    return bert && bert->is_initialized && bert->weights.cls_w && bert->weights.cls_out_w;
+    return bert && bert->is_initialized && bert->weights.cls_mode != 0 && bert->weights.cls_out_w;
 }
 
 int eif_bert_rank(eif_bert_t *bert, const char *query, const char *doc, float *score)
@@ -1520,10 +1558,15 @@ int eif_bert_rank(eif_bert_t *bert, const char *query, const char *doc, float *s
     if (rc != 0) return -3;
 
     const int dim = bert->config.dim;
-    float *hid = bert->scratch_proj;                 /* [dim], free after the forward pass */
-    bert_gemm(hid, bert->weights.cls_w, NULL, bert->scratch_seq_x, bert->weights.cls_b, 1, dim, dim, bert->weights.cls_qtype);
     double acc = bert->weights.cls_out_b;
-    for (int d = 0; d < dim; d++) acc += (double)tanhf(hid[d]) * bert->weights.cls_out_w[d];
+    if (bert->weights.cls_mode == 1) {
+        float *hid = bert->scratch_proj;             /* [dim], free after the forward pass */
+        bert_gemm(hid, bert->weights.cls_w, NULL, bert->scratch_seq_x, bert->weights.cls_b, 1, dim, dim, bert->weights.cls_qtype);
+        for (int d = 0; d < dim; d++) acc += (double)tanhf(hid[d]) * bert->weights.cls_out_w[d];
+    } else {                                         /* modes 2 and 3: one projection of h[CLS] */
+        const float *h = bert->scratch_seq_x;
+        for (int d = 0; d < dim; d++) acc += (double)h[d] * bert->weights.cls_out_w[d];
+    }
     *score = (float)acc;
     return 0;
 }
